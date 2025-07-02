@@ -1,0 +1,8 @@
+[package]
+name = "memos_core" # <--- 在这里修改
+version = "0.1.0"
+edition = "2021"   # <--- 统一为 2021
+
+[dependencies]
+anyhow = "1.0"
+async-trait = "0.1"

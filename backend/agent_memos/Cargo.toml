@@ -1,0 +1,12 @@
+[package]
+name = "agent_memos"
+version = "0.1.0"
+edition = "2021" # <--- 统一为 2021
+
+[dependencies]
+# 将依赖项的名字和路径都修改为新的名字
+memos_core = { path = "../memos_core" } # <--- 在这里修改
+
+# 其他依赖不变
+anyhow = "1.0"
+async-trait = "0.1"

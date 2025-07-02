@@ -1,0 +1,15 @@
+[package]
+name = "memos_cli"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+# CLI需要能创建和使用调度器
+orchestrator = { path = "../orchestrator" }
+
+# CLI需要知道“合同”里有什么指令
+memos_core = { path = "../memos_core" }
+
+# 其他通用依赖
+anyhow = "1.0"
+tokio = { version = "1", features = ["full"] }
