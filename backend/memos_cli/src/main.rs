@@ -1,62 +1,68 @@
 use orchestrator::Orchestrator;
-use memos_core::{Command, Response};
-use std::io::{self, Write};
+use agent_memos::MemosAgent;
+use memos_core::{Agent, Command, Response};
+// 导入 rustyline 的 Editor 和它的默认 Helper
+use rustyline::DefaultEditor; 
 
-// 使用 tokio::main 宏，让我们的 main 函数可以支持 async/await
 #[tokio::main]
 async fn main() -> Result<(), anyhow::Error> {
-    println!("欢迎使用 Memos 智能助理 (CLI版)");
-    println!("请输入您的指令 (例如: '帮我记一下明天要开会')，输入 'exit' 退出。");
+    println!("--- Memos Agent CLI Initializing ---");
 
-    // 1. 创建我们的中枢调度器实例
-    let orchestrator = Orchestrator::new();
+    let memos_agent = MemosAgent::new()?;
+    let agents: Vec<Box<dyn Agent>> = vec![Box::new(memos_agent)];
+    println!("Agents loaded: {} agent(s)", agents.len());
 
-    // 2. 进入一个无限循环，持续接收用户输入
+    let orchestrator = Orchestrator::new(agents);
+    println!("Orchestrator created.");
+    println!("\n欢迎使用 Memos 智能助理 (CLI版)");
+    println!("请输入您的指令 (例如: '帮我记一下明天要开会'), 输入 'exit' 或按 Ctrl+C 退出。");
+
+    // 创建一个 rustyline 的默认编辑器实例，这是最简单的方式
+    let mut rl = DefaultEditor::new()?;
+
+    // 使用 rustyline 的循环
     loop {
-        print!("> ");
-        // 确保提示符立即显示出来
-        io::stdout().flush()?;
+        let readline = rl.readline("> ");
+        match readline {
+            Ok(line) => {
+                let input = line.trim();
+                // 将输入添加到历史记录中
+                let _ = rl.add_history_entry(input);
 
-        let mut input = String::new();
-        // 读取用户在命令行输入的一行
-        io::stdin().read_line(&mut input)?;
+                if input.is_empty() {
+                    continue;
+                }
+                if input.eq_ignore_ascii_case("exit") {
+                    break;
+                }
 
-        let input = input.trim(); // 去掉输入内容前后的空格和换行符
+                let command = Command::ProcessText(input.to_string());
+                println!("[CLI] Sending command to orchestrator...");
 
-        // 如果用户输入 "exit"，就退出程序
-        if input.eq_ignore_ascii_case("exit") {
-            println!("感谢使用，再见！");
-            break;
-        }
+                let result = orchestrator.dispatch(&command).await;
 
-        // 如果用户输入为空，就继续下一次循环
-        if input.is_empty() {
-            continue;
-        }
-
-        // 3. 将用户的输入文本包装成一个 Command
-        let command = Command::ProcessText(input.to_string());
-
-        // 4. 调用调度器来处理这个指令，并等待结果
-        println!("[CLI] Sending command to orchestrator...");
-        match orchestrator.process_command(command).await {
-            Ok(response) => {
-                // 5. 根据调度器返回的 Response，以友好的方式显示给用户
-                match response {
-                    Response::Text(text) => {
-                        println!("[助理]: {}", text);
-                    }
-                    Response::FileToOpen(path) => {
-                        println!("[助理]: 我需要为您打开这个文件: {:?}", path);
+                println!("\n[助理]:");
+                match result {
+                    Ok(response) => match response {
+                        Response::Text(text) => {
+                            println!("{}", text);
+                        }
+                        Response::FileToOpen(path) => {
+                            println!("请求打开文件: {:?}", path);
+                        }
+                    },
+                    Err(e) => {
+                        eprintln!("发生错误: {}", e);
                     }
                 }
+                println!();
             }
-            Err(e) => {
-                // 如果处理过程中发生任何错误，就打印出来
-                eprintln!("[错误]: 处理指令时发生错误: {}", e);
+            Err(_) => {
+                break;
             }
         }
     }
 
+    println!("感谢使用，再见！");
     Ok(())
 }

@@ -1,12 +1,16 @@
 [package]
 name = "agent_memos"
 version = "0.1.0"
-edition = "2021" # <--- 统一为 2021
+edition = "2021"
 
 [dependencies]
-# 将依赖项的名字和路径都修改为新的名字
-memos_core = { path = "../memos_core" } # <--- 在这里修改
-
-# 其他依赖不变
+memos_core = { path = "../memos_core" }
 anyhow = "1.0"
 async-trait = "0.1"
+
+# 新增的数据库和时间相关依赖
+rusqlite = { version = "0.31.0", features = ["bundled"] } # "bundled"确保在不同系统上都能轻松编译
+r2d2 = "0.8.10"
+r2d2_sqlite = "0.24.0"
+chrono = "0.4.38" # <-- 添加这一行
+dirs = "5.0" 
