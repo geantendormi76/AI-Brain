@@ -1,17 +1,13 @@
 [workspace]
-resolver = "2" # 保持这一行，消除警告
+resolver = "2"
 
 members = [
-    "memos_core", # <--- 在这里修改
+    "memos_core",
     "agent_memos",
     "orchestrator",
     "memos_cli"
 ]
 
-# 定义默认的构建目标，这里我们先构建CLI
-default-members = ["memos_cli"]
-
-# 在这里可以定义所有成员共享的配置，比如优化级别
 [profile.release]
 lto = true
 codegen-units = 1

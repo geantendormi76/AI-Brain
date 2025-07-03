@@ -4,13 +4,9 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-# CLI需要能创建和使用调度器
 orchestrator = { path = "../orchestrator" }
-agent_memos = { path = "../agent_memos" } # <-- 添加这一行
-# CLI需要知道“合同”里有什么指令
+agent_memos = { path = "../agent_memos" }
 memos_core = { path = "../memos_core" }
-
-# 其他通用依赖
 anyhow = "1.0"
-tokio = { version = "1", features = ["full"] }
-rustyline = "14.0" # <-- 添加这一行
+tokio = { version = "1", features = ["full"] } # 确保tokio有full特性
+rustyline = "14.0"
