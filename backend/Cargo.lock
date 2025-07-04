@@ -23,8 +23,10 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "async-trait",
+ "bytes",
  "chrono",
  "dirs",
+ "futures-util",
  "jieba-rs",
  "memos_core",
  "qdrant-client",
@@ -1170,6 +1172,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "async-trait",
+ "tokio",
 ]
 
 [[package]]
@@ -1317,6 +1320,9 @@ dependencies = [
  "agent_memos",
  "anyhow",
  "memos_core",
+ "reqwest",
+ "serde",
+ "serde_json",
  "tokio",
 ]
 

@@ -1,31 +1,20 @@
-// --- 粘贴下面的全部代码到 agent_memos/src/lib.rs ---
+// agent_memos/src/lib.rs
 
+mod query_expander; // 声明新模块
+use query_expander::QueryExpander; // 导入 QueryExpander
+// use 声明也相应简化
 use memos_core::{Agent, Command, Response};
 use async_trait::async_trait;
 use r2d2_sqlite::SqliteConnectionManager;
 use r2d2::Pool;
 use chrono::Utc;
 use std::collections::HashMap;
-use qdrant_client::qdrant::point_id;
-use qdrant_client::{
-    Payload,
-    Qdrant,
-    qdrant::{
-        CreateCollectionBuilder,
-        Distance,
-        PointStruct,
-        VectorParamsBuilder,
-        UpsertPointsBuilder,
-        SearchPointsBuilder,
-        ScoredPoint,
-        Vector, 
-        vector::Vector as QdrantVectorEnums, 
-        DenseVector,
-    }
-};
+use qdrant_client::qdrant::{PointStruct, Vector, VectorParamsBuilder, CreateCollectionBuilder, Distance, UpsertPointsBuilder, SearchPointsBuilder, ScoredPoint, point_id, vector::Vector as QdrantVectorEnums, DenseVector};
+use qdrant_client::{Payload, Qdrant};
 use serde_json::json;
+use std::any::Any;
 
-// --- 数据结构定义 (保持不变) ---
+// 移除所有与LLM相关的 struct 定义（EmbeddingRequest除外）
 #[derive(serde::Serialize)]
 struct EmbeddingRequest<'a> {
     content: &'a str,
@@ -36,28 +25,6 @@ struct EmbeddingData {
 }
 #[derive(Debug, serde::Deserialize)]
 struct EmbeddingResponse(Vec<EmbeddingData>);
-#[derive(serde::Serialize)]
-struct ChatMessage<'a> {
-    role: &'a str,
-    content: &'a str,
-}
-#[derive(serde::Serialize)]
-struct ChatCompletionRequest<'a> {
-    messages: Vec<ChatMessage<'a>>,
-    max_tokens: u32,
-}
-#[derive(serde::Deserialize, Debug)]
-struct ChatChoice {
-    message: ChatResponseMessage,
-}
-#[derive(serde::Deserialize, Debug)]
-struct ChatResponseMessage {
-    content: String,
-}
-#[derive(serde::Deserialize, Debug)]
-struct ChatCompletionResponse {
-    choices: Vec<ChatChoice>,
-}
 
 type DbPool = Pool<SqliteConnectionManager>;
 const COLLECTION_NAME: &str = "memos";
@@ -65,7 +32,8 @@ const EMBEDDING_DIM: u64 = 1024;
 
 pub struct MemosAgent {
     sql_pool: DbPool,
-    qdrant_client: Qdrant, 
+    qdrant_client: Qdrant,
+    query_expander: QueryExpander, // 新增字段
 }
 
 impl MemosAgent {
@@ -98,143 +66,31 @@ impl MemosAgent {
             println!("[MemosAgent-DB] Found existing collection '{}'.", COLLECTION_NAME);
         }
 
-        Ok(Self { sql_pool, qdrant_client })
+        Ok(Self { 
+            sql_pool, 
+            qdrant_client,
+            query_expander: QueryExpander::new(), // 初始化 QueryExpander
+        })
     }
 
-    async fn generate_hypothetical_document(&self, query: &str) -> Result<String, anyhow::Error> {
-        // ... 此函数内容保持不变 ...
-        println!("[MemosAgent-HyDE] Generating hypothetical document for query: '{}'", query);
-        let client = reqwest::Client::new();
-        let chat_url = "http://localhost:8282/v1/chat/completions";
-        let system_prompt = r#"You are a helpful assistant. Your task is to provide a direct, factual, and likely answer to the user's question. You must first think in a <think> block, and then provide the answer.
-
-    <example>
-    <user_query>What are the advantages of Rust?</user_query>
-    <assistant_response><think>The user is asking about the advantages of the Rust programming language. I should list its key features like performance, memory safety, and concurrency.</think>Rust's main advantages are its high performance, strong memory safety guarantees without a garbage collector, and excellent support for concurrent programming.</assistant_response>
-    </example>
-
-    Now, answer the user's query.
-    "#;
-        let request_body = ChatCompletionRequest {
-            messages: vec![
-                ChatMessage { role: "system", content: system_prompt },
-                ChatMessage { role: "user", content: query },
-            ],
-            max_tokens: 256,
-        };
-        let response = client.post(chat_url).json(&request_body).send().await?;
-        if !response.status().is_success() {
-            let error_body = response.text().await?;
-            return Err(anyhow::anyhow!("HyDE generation service returned an error: {}", error_body));
-        }
-        let mut chat_response = response.json::<ChatCompletionResponse>().await?;
-        if let Some(choice) = chat_response.choices.pop() {
-            let raw_content = choice.message.content;
-            println!("[MemosAgent-HyDE] Raw generated content: '{}'", raw_content);
-            let clean_doc = if let Some(split_content) = raw_content.split("</think>").nth(1) {
-                split_content.trim().to_string()
-            } else {
-                raw_content.trim().to_string()
-            };
-            if clean_doc.is_empty() {
-                println!("[MemosAgent-HyDE] Generated document is empty after cleaning, falling back to original query.");
-                return Ok(query.to_string());
-            }
-            println!("[MemosAgent-HyDE] Cleaned document for embedding: '{}'", clean_doc);
-            Ok(clean_doc)
-        } else {
-            println!("[MemosAgent-HyDE] Could not generate document, falling back to original query.");
-            Ok(query.to_string())
-        }
-    }
-
-    async fn get_embedding(&self, text: &str) -> Result<Vec<f32>, anyhow::Error> {
-
-        println!("[MemosAgent-Embed] Requesting REAL vector for text: '{}'", text);
-        let client = reqwest::Client::new();
-        let embedding_url = "http://localhost:8181/embedding";
-        let response = client.post(embedding_url).json(&EmbeddingRequest { content: text }).send().await?;
-        if !response.status().is_success() {
-            let error_body = response.text().await?;
-            return Err(anyhow::anyhow!("Embedding service returned an error: {}", error_body));
-        }
-        let mut embedding_response = response.json::<EmbeddingResponse>().await?;
-        if let Some(mut first_item) = embedding_response.0.pop() {
-            if let Some(embedding_vector) = first_item.embedding.pop() {
-                println!("[MemosAgent-Embed] Received REAL {}d vector.", embedding_vector.len());
-                Ok(embedding_vector)
-            } else {
-                Err(anyhow::anyhow!("Embedding service returned an item with an empty embedding list."))
-            }
-        } else {
-            Err(anyhow::anyhow!("Embedding service returned an empty array."))
-        }
-    }
-
-    async fn save_memo(&self, content: &str) -> Result<(), anyhow::Error> {
-
-        let conn = self.sql_pool.get()?;
-        let now = Utc::now().to_rfc3339();
-        conn.execute("INSERT INTO facts (content, created_at) VALUES (?1, ?2)", &[content, &now])?;
-        let memo_id = conn.last_insert_rowid();
-        println!("[MemosAgent-DB] Saved to SQLite with ID: {}", memo_id);
-        let vector_data = self.get_embedding(content).await?;
-        let qdrant_vector = Vector {
-            vector: Some(QdrantVectorEnums::Dense(DenseVector { data: vector_data })),
-            ..Default::default()
-        };
-        let payload: Payload = json!({"content": content,"created_at": now}).try_into().unwrap();
-        let points = vec![PointStruct::new(memo_id as u64, qdrant_vector, payload)];
-        self.qdrant_client.upsert_points(UpsertPointsBuilder::new(COLLECTION_NAME.to_string(), points)).await?;
-        println!("[MemosAgent-DB] Upserted point to Qdrant with ID: {}", memo_id);
-        Ok(())
-    }
-
-    fn extract_keywords(&self, query_text: &str) -> Vec<String> {
-        println!("[MemosAgent-Keyword] Extracting keywords with Jieba...");
-        use jieba_rs::Jieba;
-        use stop_words::{get, LANGUAGE};
-
-        let jieba = Jieba::new();
-        let stop_words = get(LANGUAGE::Chinese);
-
-        let keywords: Vec<String> = jieba.cut_for_search(query_text, true)
-            .into_iter()
-            .map(|s| s.to_lowercase())
-            .filter(|word| !stop_words.contains(word))
-            .collect();
-        
-        println!("[MemosAgent-Keyword] Extracted keywords: {:?}", keywords);
-        keywords
-    }
-
-
-    fn reciprocal_rank_fusion(
+    // 新增：支持融合多路搜索结果的 RRF 函数
+    fn reciprocal_rank_fusion_multi(
         &self, 
-        vec_points: Vec<ScoredPoint>, 
-        kw_points: Vec<ScoredPoint>,
+        ranked_lists: Vec<Vec<ScoredPoint>>,
         k: u32
     ) -> Vec<ScoredPoint> {
-        println!("[MemosAgent-RRF] Starting Reciprocal Rank Fusion...");
+        println!("[MemosAgent-RRF] Fusing {} ranked lists...", ranked_lists.len());
         
         let mut fused_scores: HashMap<u64, f32> = HashMap::new();
         let mut point_data: HashMap<u64, ScoredPoint> = HashMap::new();
 
-        // 处理向量搜索结果
-        for (rank, point) in vec_points.into_iter().enumerate() {
-            if let Some(point_id::PointIdOptions::Num(memo_id)) = point.id.as_ref().and_then(|p| p.point_id_options.as_ref()) {
-                let score = 1.0 / (k as f32 + (rank + 1) as f32);
-                *fused_scores.entry(*memo_id).or_insert(0.0) += score;
-                point_data.entry(*memo_id).or_insert(point);
-            }
-        }
-
-        // 处理关键词搜索结果
-        for (rank, point) in kw_points.into_iter().enumerate() {
-            if let Some(point_id::PointIdOptions::Num(memo_id)) = point.id.as_ref().and_then(|p| p.point_id_options.as_ref()) {
-                let score = 1.0 / (k as f32 + (rank + 1) as f32); // RRF核心算法
-                *fused_scores.entry(*memo_id).or_insert(0.0) += score;
-                point_data.entry(*memo_id).or_insert(point);
+        for list in ranked_lists {
+            for (rank, point) in list.into_iter().enumerate() {
+                if let Some(point_id::PointIdOptions::Num(memo_id)) = point.id.as_ref().and_then(|p| p.point_id_options.as_ref()) {
+                    let score = 1.0 / (k as f32 + (rank + 1) as f32);
+                    *fused_scores.entry(*memo_id).or_insert(0.0) += score;
+                    point_data.entry(*memo_id).or_insert(point);
+                }
             }
         }
 
@@ -257,110 +113,214 @@ impl MemosAgent {
         final_ranked_list
     }
 
-    async fn query_memos(&self, query_text: &str) -> Result<String, anyhow::Error> {
-        println!("[MemosAgent-Query V3.6-RRF] Received query: '{}'", query_text);
 
-        // --- 步骤 1: 准备工作 ---
-        let keywords = self.extract_keywords(query_text);
-        let hypothetical_document = self.generate_hypothetical_document(query_text).await?;
-        let query_vector = self.get_embedding(&hypothetical_document).await?;
-
-        // --- 步骤 2: 并行检索 ---
-        println!("[MemosAgent-Query V3.6-RRF] Starting parallel search...");
-
-        // 任务1: 向量搜索
-        let vector_search = async {
-            self.qdrant_client.search_points(
-                SearchPointsBuilder::new(COLLECTION_NAME, query_vector, 10) // query_vector的所有权在这里被移动
-                    .with_payload(true)
-            ).await.map_err(|e| anyhow::anyhow!("Vector search failed: {}", e))
+    // --- `save` 方法保持核心逻辑，但可以简化，因为它总是被调用
+    pub async fn save(&self, content: &str) -> Result<(), anyhow::Error> {
+        println!("[MemosAgent] Saving memo: '{}'", content);
+        let conn = self.sql_pool.get()?;
+        let now = Utc::now().to_rfc3339();
+        conn.execute("INSERT INTO facts (content, created_at) VALUES (?1, ?2)", &[content, &now])?;
+        let memo_id = conn.last_insert_rowid();
+        println!("[MemosAgent-DB] Saved to SQLite with ID: {}", memo_id);
+        let vector_data = self.get_embedding(content).await?;
+        let qdrant_vector = Vector {
+            vector: Some(QdrantVectorEnums::Dense(DenseVector { data: vector_data })),
+            ..Default::default()
         };
+        let payload: Payload = json!({"content": content,"created_at": now}).try_into().unwrap();
+        let points = vec![PointStruct::new(memo_id as u64, qdrant_vector, payload)];
+        self.qdrant_client.upsert_points(UpsertPointsBuilder::new(COLLECTION_NAME.to_string(), points)).await?;
+        println!("[MemosAgent-DB] Upserted point to Qdrant with ID: {}", memo_id);
+        Ok(())
+    }
 
-        // 任务2: 关键词搜索
-        let keyword_search = async {
-            if keywords.is_empty() { 
-                // 如果没有关键词，返回一个OK的空Vec，以匹配返回类型
-                return Ok(vec![]); 
-            } 
-            use qdrant_client::qdrant::{r#match::MatchValue, Condition, Filter};
-            let conditions: Vec<Condition> = keywords.iter()
-                .map(|k| Condition::matches("content", MatchValue::Text(k.clone())))
-                .collect();
-            let filter = Filter::must(conditions);
-            let scroll_response = self.qdrant_client.scroll(
-                qdrant_client::qdrant::ScrollPointsBuilder::new(COLLECTION_NAME)
-                    .filter(filter).limit(10).with_payload(true)
-            ).await.map_err(|e| anyhow::anyhow!("Keyword search failed: {}", e))?;
-            
-            // 将 RetrievedPoint 转换为 ScoredPoint
-            Ok(scroll_response.result.into_iter().map(|point| {
-                ScoredPoint {
-                    id: point.id, 
-                    payload: point.payload, 
-                    score: 1.0, // 给关键词匹配结果一个基础分1.0
-                    version: 0,
-                    vectors: point.vectors,
-                    order_value: point.order_value,
-                    shard_key: point.shard_key,
-                }
-            }).collect())
-        };
-
-        // --- 步骤 3: 执行并等待结果 ---
-        let (vector_result, keyword_result) = tokio::try_join!(vector_search, keyword_search)?;
+    // --- 全新的 `recall` 方法，零LLM调用 ---
+    pub async fn recall(&self, query_text: &str) -> Result<Response, anyhow::Error> {
+        println!("[MemosAgent] Recalling V2.1 for: '{}'", query_text);
         
-        // --- 步骤 4: RRF 融合 ---
-        println!("[MemosAgent-RRF] Fusing results...");
-        let fused_points = self.reciprocal_rank_fusion(
-            vector_result.result,
-            keyword_result,
-            60 // RRF的k值
-        );
-        
-        let final_points = fused_points;
+        // 步骤 1: 使用 QueryExpander 生成查询变体
+        let expansions = self.query_expander.expand(query_text);
+        let original_query = expansions.get(0).unwrap_or(&query_text.to_string()).clone();
+        // 将所有扩展（包括原始查询）连接成一个字符串，用于扩展向量搜索
+        let expanded_query_str = expansions.join(" ");
 
-        if final_points.is_empty() {
-            return Ok("关于这个，我好像没什么印象...".to_string());
+        // 步骤 2: 三路并行检索
+        let (vec_original_res, vec_expanded_res, keyword_res) = tokio::try_join!(
+            // 第一路: 原始查询的向量搜索 (高精度)
+            async {
+                let vector = self.get_embedding(&original_query).await?;
+                self.qdrant_client.search_points(
+                    SearchPointsBuilder::new(COLLECTION_NAME, vector, 5).with_payload(true)
+                ).await.map_err(|e| anyhow::anyhow!("Original vector search failed: {}", e))
+            },
+            // 第二路: 扩展查询的向量搜索 (高召回)
+            async {
+                let vector = self.get_embedding(&expanded_query_str).await?;
+                self.qdrant_client.search_points(
+                    SearchPointsBuilder::new(COLLECTION_NAME, vector, 5).with_payload(true)
+                ).await.map_err(|e| anyhow::anyhow!("Expanded vector search failed: {}", e))
+            },
+            // 第三路: 关键词搜索 (补充精确匹配)
+            async {
+                let keywords = self.extract_keywords(query_text);
+                if keywords.is_empty() { return Ok(vec![]); } 
+                use qdrant_client::qdrant::{r#match::MatchValue, Condition, Filter};
+                let filter = Filter::must(keywords.iter().map(|k| Condition::matches("content", MatchValue::Text(k.clone()))));
+                let scroll_response = self.qdrant_client.scroll(
+                    qdrant_client::qdrant::ScrollPointsBuilder::new(COLLECTION_NAME).filter(filter).limit(5).with_payload(true)
+                ).await.map_err(|e| anyhow::anyhow!("Keyword search failed: {}", e))?;
+                // 将关键词搜索结果包装成 ScoredPoint 以便融合
+                Ok(scroll_response.result.into_iter().map(|p: qdrant_client::qdrant::RetrievedPoint| {
+                    ScoredPoint {
+                        id: p.id,
+                        payload: p.payload,
+                        score: 1.0,
+                        version: 0, // 修正：RetrievedPoint中没有version字段，我们为其提供一个默认值0
+                        vectors: p.vectors,
+                        order_value: p.order_value,
+                        shard_key: p.shard_key,
+                    }
+                }).collect())
+            }
+        )?;
+
+        // 步骤 3: RRF融合三路结果
+        let all_results: Vec<Vec<ScoredPoint>> = vec![
+            vec_original_res.result.clone(), 
+            vec_expanded_res.result, 
+            keyword_res.clone()
+        ];
+        let fused_points = self.reciprocal_rank_fusion_multi(all_results, 60);
+        
+        // 步骤 4: 动态阈值过滤 (保持不变)
+        let filtered_points = self.apply_dynamic_threshold(fused_points);
+
+        if filtered_points.is_empty() {
+            return Ok(Response::Text("关于这个，我好像没什么印象...".to_string()));
         }
 
-        // --- 步骤 5: 格式化输出 ---
-        println!("[MemosAgent-RRF] Formatting final results...");
-        let results: Vec<String> = final_points.iter().enumerate().map(|(index, point)| {
-            let content = point.payload.get("content")
-                .and_then(|v| v.as_str()).map(|s| s.to_string())
-                .unwrap_or_else(|| "[无效内容]".to_string());
-            // RRF分数很小，乘以1000方便观察
-            format!("{}. {} (Fusion Score: {:.4})", index + 1, content, point.score * 1000.0)
+        // 步骤 5: 高置信度判断 (保持不变)
+        if !filtered_points.is_empty() {
+            // 获取融合后的Top-1结果的ID
+            if let Some(top_id) = filtered_points[0].id.as_ref().and_then(|p| p.point_id_options.as_ref()) {
+                // 检查这个ID是否存在于原始向量搜索的结果中
+                let in_vector_results = vec_original_res.result.iter().any(|p| p.id.as_ref().and_then(|pi| pi.point_id_options.as_ref()) == Some(top_id));
+                // 检查这个ID是否存在于关键词搜索的结果中
+                let in_keyword_results = keyword_res.iter().any(|p| p.id.as_ref().and_then(|pi| pi.point_id_options.as_ref()) == Some(top_id));
+
+                // 如果Top-1结果同时被向量和关键词找到，则认为是高置信度匹配
+                if in_vector_results && in_keyword_results {
+                    if let Some(content) = filtered_points[0].payload.get("content").and_then(|v| v.as_str()) {
+                        println!("[MemosAgent] High confidence (vector+keyword consensus) match found. Returning directly.");
+                        return Ok(Response::Text(content.to_string()));
+                    }
+                }
+            }
+        }
+
+        // 步骤 6: 低置信度时的处理 (保持不变)
+        println!("[MemosAgent] Low confidence matches. Returning summary.");
+        let top_results_summary: Vec<String> = filtered_points.iter().take(3).filter_map(|p| {
+            p.payload.get("content").and_then(|v| v.as_str()).map(|s| format!("- {}", s))
         }).collect();
 
-        Ok(format!("关于'{}'，我找到了这些相关记忆：\n{}", query_text, results.join("\n")))
+        let response_text = format!(
+            "关于“{}”，我没有找到直接的记忆，但发现了一些可能相关的内容：\n{}",
+            query_text,
+            top_results_summary.join("\n")
+        );
+
+        Ok(Response::Text(response_text))
+    }
+
+    // --- 保持不变的辅助函数 ---
+    async fn get_embedding(&self, text: &str) -> Result<Vec<f32>, anyhow::Error> {
+        println!("[MemosAgent-Embed] Requesting vector for text: '{}'", text);
+        let client = reqwest::Client::new();
+        let embedding_url = "http://localhost:8181/embedding";
+        let response = client.post(embedding_url).json(&EmbeddingRequest { content: text }).send().await?;
+        if !response.status().is_success() {
+            let error_body = response.text().await?;
+            return Err(anyhow::anyhow!("Embedding service returned an error: {}", error_body));
+        }
+        let mut embedding_response = response.json::<EmbeddingResponse>().await?;
+        if let Some(mut first_item) = embedding_response.0.pop() {
+            if let Some(embedding_vector) = first_item.embedding.pop() {
+                println!("[MemosAgent-Embed] Received {}d vector.", embedding_vector.len());
+                Ok(embedding_vector)
+            } else {
+                Err(anyhow::anyhow!("Embedding service returned an item with an empty embedding list."))
+            }
+        } else {
+            Err(anyhow::anyhow!("Embedding service returned an empty array."))
+        }
+    }
+
+    fn extract_keywords(&self, query_text: &str) -> Vec<String> {
+        println!("[MemosAgent-Keyword] Extracting keywords with Jieba...");
+        use jieba_rs::Jieba;
+        use stop_words::{get, LANGUAGE};
+
+        let jieba = Jieba::new();
+        let stop_words = get(LANGUAGE::Chinese);
+
+        let keywords: Vec<String> = jieba.cut_for_search(query_text, true)
+            .into_iter()
+            .map(|s| s.to_lowercase())
+            .filter(|word| !stop_words.contains(word))
+            .collect();
+        
+        println!("[MemosAgent-Keyword] Extracted keywords: {:?}", keywords);
+        keywords
+    }
+    
+
+    fn apply_dynamic_threshold(&self, points: Vec<ScoredPoint>) -> Vec<ScoredPoint> {
+        if points.is_empty() {
+            return points;
+        }
+        let scores: Vec<f32> = points.iter().map(|p| p.score).collect();
+        if scores.len() == 1 {
+            return if scores[0] > 0.01 { points } else { vec![] }; // RRF分数很小，阈值也要小
+        }
+        let mut best_drop_index = 0;
+        let mut max_drop = 0.0;
+        for i in 1..scores.len() {
+            let drop = scores[i-1] - scores[i];
+            if drop > max_drop {
+                max_drop = drop;
+                best_drop_index = i;
+            }
+        }
+        // RRF分数断崖会更明显，可以用一个更敏感的比例
+        if max_drop > scores[best_drop_index - 1] * 0.3 && best_drop_index > 0 {
+            println!("[MemosAgent-Threshold] Found score drop at index {}, truncating.", best_drop_index);
+            return points.into_iter().take(best_drop_index).collect();
+        }
+        println!("[MemosAgent-Threshold] No significant drop found, returning all points.");
+        points
     }
 }
+
 
 #[async_trait]
 impl Agent for MemosAgent {
     fn name(&self) -> &'static str { "memos_agent" }
-    fn interests(&self) -> &[&'static str] { &[""] }
+    
+    // interests 现在不再重要，但为了满足 trait 定义，我们保留它
+    fn interests(&self) -> &[&'static str] { &["SaveIntent", "RecallIntent"] }
+
+    fn as_any(&self) -> &dyn Any {
+    self}
 
     async fn handle_command(&self, command: &Command) -> Result<Response, anyhow::Error> {
+        // 这个函数现在只是一个简单的分发器，实际逻辑在 save 和 recall 中
+        // Orchestrator 将直接调用 save 和 recall，所以这个函数可能不会被直接使用
+        // 但为了满足Agent trait，我们保留一个简单的实现
         match command {
             Command::ProcessText(text) => {
-                let is_query = text.starts_with("查询") || text.starts_with("查找") || text.starts_with("搜索") || text.contains("是什么");
-                if is_query {
-                    let query_content = if text.contains("是什么") {
-                        text.to_string()
-                    } else {
-                        text.replace("查询", "").replace("查找", "").replace("搜索", "").trim().to_string()
-                    };
-                    if query_content.is_empty() {
-                        return Ok(Response::Text("请提供要查询的内容。例如：查询我最喜欢的语言".to_string()));
-                    }
-                    let response_text = self.query_memos(&query_content).await?;
-                    Ok(Response::Text(response_text))
-                } else {
-                    self.save_memo(text).await?;
-                    Ok(Response::Text("好的，已经记下了。".to_string()))
-                }
+                // 默认行为是回忆
+                self.recall(text).await
             }
         }
     }

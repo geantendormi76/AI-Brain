@@ -12,4 +12,7 @@ agent_memos = { path = "../agent_memos" }
 
 # 其他通用依赖
 anyhow = "1.0"
-tokio = { version = "1", features = ["full"] } # 我们需要tokio来处理异步
+reqwest = { version = "0.12", features = ["json"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+tokio = { version = "1", features = ["full"] }
