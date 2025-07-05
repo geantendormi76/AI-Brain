@@ -2,21 +2,49 @@ use orchestrator::Orchestrator;
 use agent_memos::MemosAgent;
 use memos_core::{Agent, Command, Response};
 use rustyline::DefaultEditor;
+use sysinfo::System;
+// 引入标准库中的 env 模块来处理环境变量
+use std::env;
 
 #[tokio::main]
 async fn main() -> Result<(), anyhow::Error> {
     println!("--- Memos Agent CLI Initializing ---");
 
+    // =================================================================
+    // == 硬件感知与智能决策模块 (V2 - 带手动覆盖) ==
+    // =================================================================
+    
+    // 1. 优先检查环境变量，作为手动覆盖开关
+    let force_performance_mode = env::var("FORCE_PERFORMANCE_MODE").is_ok();
+
+    let reranker_llm_url: Option<&str> = if force_performance_mode {
+        println!("[HardwareDetector] FORCE_PERFORMANCE_MODE is set. Forcing Performance-First mode.");
+        None
+    } else {
+        // 2. 如果没有手动覆盖，则执行自动检测
+        let mut sys = System::new();
+        sys.refresh_memory();
+        let total_memory_gb = sys.total_memory() as f64 / 1024.0 / 1024.0;
+        println!("[HardwareDetector] Total system memory: {:.2} GB (Note: May be inaccurate in WSL)", total_memory_gb);
+
+        const MEMORY_THRESHOLD_GB: f64 = 12.0;
+        if total_memory_gb >= MEMORY_THRESHOLD_GB {
+            println!("[HardwareDetector] Auto-detected: Memory is sufficient. Enabling Quality-First mode.");
+            Some("http://localhost:8080")
+        } else {
+            println!("[HardwareDetector] Auto-detected: Memory is limited. Enabling Performance-First mode.");
+            None
+        }
+    };
+    // =================================================================
+
     let qdrant_url = "http://localhost:6334";
     let llm_url = "http://localhost:8282";
-    // 恢复 Re-ranker URL 配置
-    let reranker_llm_url: Option<&str> = Some("http://localhost:8080"); // 设为 Some(...) 启用质量模式
 
     let memos_agent = MemosAgent::new(qdrant_url).await?;
     let agents: Vec<Box<dyn Agent>> = vec![Box::new(memos_agent)];
     println!("Agents loaded: {} agent(s)", agents.len());
 
-    // 修正：调用新的 Orchestrator::new 签名
     let orchestrator = Orchestrator::new(agents, llm_url, reranker_llm_url);
     println!("Orchestrator created.");
     println!("\n欢迎使用 Memos 智能助理 (CLI版)");
