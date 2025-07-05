@@ -4,3 +4,4 @@
 pub mod recall_expert;
 pub mod router;
 pub mod save_expert;
+pub mod re_ranker;

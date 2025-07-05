@@ -7,18 +7,17 @@ use rustyline::DefaultEditor;
 async fn main() -> Result<(), anyhow::Error> {
     println!("--- Memos Agent CLI Initializing ---");
 
-    // 定义服务 URL
     let qdrant_url = "http://localhost:6334";
-    // 在 V3.0 任务分解架构中，我们只需要一个 LLM 服务 URL
     let llm_url = "http://localhost:8282";
+    // 恢复 Re-ranker URL 配置
+    let reranker_llm_url: Option<&str> = Some("http://localhost:8080"); // 设为 Some(...) 启用质量模式
 
-    // 初始化 MemosAgent
     let memos_agent = MemosAgent::new(qdrant_url).await?;
     let agents: Vec<Box<dyn Agent>> = vec![Box::new(memos_agent)];
     println!("Agents loaded: {} agent(s)", agents.len());
 
-    // 使用新的、简化的签名初始化 Orchestrator
-    let orchestrator = Orchestrator::new(agents, llm_url);
+    // 修正：调用新的 Orchestrator::new 签名
+    let orchestrator = Orchestrator::new(agents, llm_url, reranker_llm_url);
     println!("Orchestrator created.");
     println!("\n欢迎使用 Memos 智能助理 (CLI版)");
     println!("请输入您的指令 (例如: '帮我记一下明天要开会'), 输入 'exit' 或按 Ctrl+C 退出。");

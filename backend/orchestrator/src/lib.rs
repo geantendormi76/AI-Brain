@@ -14,6 +14,8 @@ use experts::{
     router::{self, RoutingDecision, ToolToCall},
     save_expert,
     recall_expert,
+    // 引入 Re-ranker 相关的类型
+    re_ranker::{ReRanker, ReRankRequest, DocumentToRank, ReRankStrategy},
 };
 
 // ---- LLMConfig: 用于持有 client 和 url ----
@@ -37,15 +39,28 @@ pub struct Orchestrator {
     agents: Vec<Box<dyn Agent>>,
     llm_config: LLMConfig,
     conversation_history: Arc<Mutex<Vec<String>>>,
+    // 恢复 reranker 字段，作为可选的精排专家
+    reranker: Option<ReRanker>,
 }
 
 impl Orchestrator {
-    pub fn new(agents: Vec<Box<dyn Agent>>, llm_url: &str) -> Self {
+    // 恢复 reranker_llm_url 参数
+    pub fn new(agents: Vec<Box<dyn Agent>>, llm_url: &str, reranker_llm_url: Option<&str>) -> Self {
         println!("[Orchestrator] V4.1 Initializing in Router-Expert mode.");
+        
+        let reranker = if let Some(url) = reranker_llm_url {
+            println!("[Orchestrator] ReRanker is ENABLED.");
+            Some(ReRanker::new(url))
+        } else {
+            println!("[Orchestrator] ReRanker is DISABLED.");
+            None
+        };
+
         Self {
             agents,
             llm_config: LLMConfig::new(llm_url),
             conversation_history: Arc::new(Mutex::new(Vec::new())),
+            reranker,
         }
     }
 
@@ -76,19 +91,18 @@ impl Orchestrator {
         Ok("好的，已经记下了。".to_string())
     }
 
-    // 查询专家
+    // 查询专家 - 现在集成了精排逻辑
     async fn handle_recall(&self, text: &str, history: &[String]) -> Result<String, anyhow::Error> {
-        let memos_agent = self.agents.iter()
-            .find_map(|a| a.as_any().downcast_ref::<MemosAgent>())
-            .ok_or_else(|| anyhow::anyhow!("MemosAgent not found"))?;
+        let memos_agent = self.agents.iter().find_map(|a| a.as_any().downcast_ref::<MemosAgent>()).ok_or_else(|| anyhow::anyhow!("MemosAgent not found"))?;
 
-        // 1. 调用LLM重写查询
+        // 1. 查询重写 (保持不变)
         println!("[RecallExpert] Rewriting query: '{}'", text);
         let messages = recall_expert::get_query_rewrite_prompt(text, history);
         let gbnf_schema = recall_expert::get_query_rewrite_gbnf_schema();
         let request_body = json!({ "messages": messages, "temperature": 0.0, "grammar": gbnf_schema });
         let chat_url = format!("{}/v1/chat/completions", self.llm_config.llm_url);
         let response = self.llm_config.client.post(&chat_url).json(&request_body).send().await?;
+
         #[derive(Deserialize)] struct ChatChoice { message: ChatMessageContent }
         #[derive(Deserialize)] struct ChatMessageContent { content: String }
         #[derive(Deserialize)] struct ChatCompletionResponse { choices: Vec<ChatChoice> }
@@ -98,11 +112,36 @@ impl Orchestrator {
         let rewritten_query = &rewritten_query_obj.rewritten_query;
         println!("[RecallExpert] Rewritten query: '{}'", rewritten_query);
 
-        // 2. 使用重写后的查询进行召回
+        // 2. 初步召回 (保持不变)
         let candidate_points = memos_agent.recall(rewritten_query).await?;
         if candidate_points.is_empty() {
-            Ok(format!("关于“{}”，我好像没什么印象...", rewritten_query))
+            return Ok(format!("关于“{}”，我好像没什么印象...", rewritten_query));
+        }
+
+        // 3. (核心修改) 条件化精排
+        if let Some(reranker) = &self.reranker {
+            // 质量优先模式
+            println!("[RecallExpert] Re-ranking candidates...");
+            let documents_to_rank: Vec<DocumentToRank> = candidate_points.iter()
+                .filter_map(|p| p.payload.get("content").and_then(|v| v.as_str()).map(|s| DocumentToRank { text: s }))
+                .collect();
+
+            let rerank_request = ReRankRequest { query: rewritten_query, documents: documents_to_rank };
+            let strategy = ReRankStrategy::ValidateTopOne { threshold: 2.0 };
+            let final_results = reranker.rank(rerank_request, strategy).await?;
+
+            if let Some(top_doc) = final_results.get(0) {
+                Ok(top_doc.text.clone())
+            } else {
+                // 如果精排后没有高置信度结果，返回低置信度总结
+                let summary: Vec<String> = candidate_points.iter().take(3)
+                    .filter_map(|p| p.payload.get("content").and_then(|v| v.as_str()).map(|s| format!("- {}", s)))
+                    .collect();
+                Ok(format!("关于“{}”，我没有找到直接答案，但发现一些可能相关的内容：{}", rewritten_query, summary.join(" ")))
+            }
         } else {
+            // 性能优先模式
+            println!("[RecallExpert] Skipping re-ranking.");
             let top_point = candidate_points.get(0).unwrap();
             // 修正：使用 map_or 来优雅地处理 Option<&str>
             let content = top_point.payload.get("content")
