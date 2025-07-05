@@ -1,41 +1,17 @@
 // orchestrator/src/lib.rs
 
-mod prompts; // 引入我们新的prompts模块
-
-use agent_memos::MemosAgent; 
+mod prompts;
+use agent_memos::MemosAgent;
 use memos_core::{Agent, Command, Response};
 use reqwest::Client;
 use serde::Deserialize;
 use serde_json::json;
 
-// ---- 新增：定义聊天API的响应结构 ----
-#[derive(Deserialize, Debug)]
-struct ChatCompletionChoice {
-    message: ChatMessageContent,
-}
-
-#[derive(Deserialize, Debug)]
-struct ChatMessageContent {
-    content: String,
-}
-
-#[derive(Deserialize, Debug)]
-struct ChatCompletionResponse {
-    choices: Vec<ChatCompletionChoice>,
-}
-
-// ---- 定义分类器的响应结构 ----
-#[derive(Deserialize, Debug)]
-struct ClassificationResponse {
-    intent: String,
-}
-
-// ---- 定义分类器的结构体 ----
+// IntentClassifier 现在只负责持有 client 和 url
 pub struct IntentClassifier {
     client: Client,
-    llm_url: String, // URL现在是服务器的根地址，如 "http://localhost:8282"
+    llm_url: String,
 }
-
 impl IntentClassifier {
     pub fn new(llm_url: &str) -> Self {
         Self {
@@ -43,95 +19,110 @@ impl IntentClassifier {
             llm_url: llm_url.to_string(),
         }
     }
-
-    // 分类方法 - 已适配聊天API
-    pub async fn classify(&self, text: &str) -> Result<String, anyhow::Error> {
-        println!("[IntentClassifier] Classifying text: '{}'", text);
-        let messages = prompts::get_intent_classification_messages(text);
-        let gbnf_schema = prompts::get_intent_gbnf_schema();
-
-        // 构建符合 /v1/chat/completions 接口的请求体
-        let request_body = json!({
-            "messages": messages, // 使用 messages 数组
-            "n_predict": 128,
-            "temperature": 0.1,
-            "grammar": gbnf_schema // GBNF 在聊天端点同样有效
-        });
-        
-        // 构造完整的聊天API端点URL
-        let chat_url = format!("{}/v1/chat/completions", self.llm_url);
-
-        let response = self.client.post(&chat_url)
-            .json(&request_body)
-            .send()
-            .await?;
-
-        if !response.status().is_success() {
-            let status = response.status();
-            let error_body = response.text().await?;
-            return Err(anyhow::anyhow!("LLM service returned an error. Status: {}. Body: {}", status, error_body));
-        }
-
-        // 解析聊天API返回的JSON结构
-        let chat_response: ChatCompletionResponse = response.json().await?;
-        
-        // 从响应中提取 content 字符串
-        let content_str = chat_response.choices
-            .get(0)
-            .map(|c| &c.message.content)
-            .ok_or_else(|| anyhow::anyhow!("Missing 'choices' in LLM chat response"))?;
-        
-        // 解析 content 字符串中的意图JSON
-        let classification: ClassificationResponse = serde_json::from_str(content_str)?;
-
-        println!("[IntentClassifier] Classified intent as: {}", classification.intent);
-        Ok(classification.intent)
-    }
+    // 移除不再使用的 classify 方法
 }
 
-// ---- Orchestrator 结构体和实现 ----
+// ---- Orchestrator 结构体和实现 (V3.0 最终版) ----
 pub struct Orchestrator {
     agents: Vec<Box<dyn Agent>>,
-    classifier: IntentClassifier,
+    // 复用 IntentClassifier 来持有 LLM 配置
+    llm_config: IntentClassifier,
+    // 移除 reranker 字段
 }
 
+// 用于解析任务列表的结构体
+#[derive(Deserialize, Debug)]
+struct Task {
+    intent: String,
+    text: String,
+}
+
+#[derive(Deserialize, Debug)]
+struct DecomposedTasks {
+    tasks: Vec<Task>,
+}
+
+
 impl Orchestrator {
-    pub fn new(agents: Vec<Box<dyn Agent>>, classifier_llm_url: &str) -> Self {
-        Self { 
+    // 简化 new 方法，不再需要 reranker_llm_url
+    pub fn new(agents: Vec<Box<dyn Agent>>, llm_url: &str) -> Self {
+        println!("[Orchestrator] Initializing in Task Decomposition mode.");
+        Self {
             agents,
-            classifier: IntentClassifier::new(classifier_llm_url),
+            llm_config: IntentClassifier::new(llm_url),
         }
     }
 
     pub async fn dispatch(&self, command: &Command) -> Result<Response, anyhow::Error> {
         match command {
             Command::ProcessText(text) => {
-                let intent = self.classifier.classify(text).await?;
+                // 1. 调用 LLM 进行任务分解
+                println!("[Orchestrator] Decomposing command: '{}'", text);
+                let messages = prompts::get_intent_classification_messages(text);
+                let gbnf_schema = prompts::get_intent_gbnf_schema();
 
-                // 遍历所有 agents，找到能处理此意图的agent
-                for agent in &self.agents {
-                    // 使用 agent.interests() 来判断该agent是否能处理这个意图
-                    if agent.interests().contains(&intent.as_str()) {
-                        // 找到了，进行向下转型以调用具体方法
-                        if let Some(memos_agent) = agent.as_any().downcast_ref::<MemosAgent>() {
-                            println!("[Orchestrator] Routing intent '{}' to agent '{}'", intent, memos_agent.name());
-                            return match intent.as_str() {
-                                "SaveIntent" => {
-                                    memos_agent.save(text).await?;
-                                    Ok(Response::Text("好的，已经记下了。".to_string()))
-                                },
-                                "RecallIntent" => {
-                                    memos_agent.recall(text).await
-                                },
-                                // 理论上不会到达这里，因为已经被 interests() 过滤
-                                _ => unreachable!(), 
-                            }
+                let request_body = json!({
+                    "messages": messages,
+                    "n_predict": 512,
+                    "temperature": 0.0,
+                    "grammar": gbnf_schema,
+                });
+                
+                let chat_url = format!("{}/v1/chat/completions", self.llm_config.llm_url);
+                let response = self.llm_config.client.post(&chat_url)
+                    .json(&request_body)
+                    .send()
+                    .await?;
+
+                if !response.status().is_success() {
+                    let status = response.status();
+                    let error_body = response.text().await?;
+                    return Err(anyhow::anyhow!("Task decomposition LLM service returned an error. Status: {}. Body: {}", status, error_body));
+                }
+
+                #[derive(Deserialize)] struct ChatChoice { message: ChatMessageContent }
+                #[derive(Deserialize)] struct ChatMessageContent { content: String }
+                #[derive(Deserialize)] struct ChatCompletionResponse { choices: Vec<ChatChoice> }
+                
+                let chat_response: ChatCompletionResponse = response.json().await?;
+                let content_str = chat_response.choices.get(0).map(|c| &c.message.content)
+                    .ok_or_else(|| anyhow::anyhow!("Missing 'choices' in LLM task decomposition response"))?;
+                
+                println!("[Orchestrator] Decomposed tasks JSON: {}", content_str);
+                let decomposed_tasks: DecomposedTasks = serde_json::from_str(content_str)?;
+
+                // 2. 遍历并执行任务列表
+                let mut responses: Vec<String> = Vec::new();
+                for task in decomposed_tasks.tasks {
+                    if let Some(memos_agent) = self.agents.iter().find_map(|a| a.as_any().downcast_ref::<MemosAgent>()) {
+                        match task.intent.as_str() {
+                            "SaveIntent" => {
+                                memos_agent.save(&task.text).await?;
+                                responses.push("好的，已经记下了。".to_string());
+                            },
+                            "RecallIntent" => {
+                                let candidate_points = memos_agent.recall(&task.text).await?;
+                                if candidate_points.is_empty() {
+                                    responses.push(format!("关于“{}”，我好像没什么印象...", task.text));
+                                } else {
+                                    let top_point = candidate_points.get(0).unwrap();
+                                    if let Some(content) = top_point.payload.get("content").and_then(|v| v.as_str()) {
+                                        responses.push(content.to_string());
+                                    }
+                                }
+                            },
+                            _ => {} // 忽略未知意图
                         }
                     }
                 }
 
-                // 如果循环结束都没有找到能处理此意图的agent
-                Ok(Response::Text("抱歉，我暂时无法理解您的意图。".to_string()))
+                // 3. 组合最终响应
+                let final_response = responses.join("\n");
+                if final_response.is_empty() {
+                    Ok(Response::Text("抱歉，我暂时无法理解您的意图。".to_string()))
+                } else {
+                    Ok(Response::Text(final_response))
+                }
             }
         }
     }

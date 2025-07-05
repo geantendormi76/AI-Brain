@@ -1320,6 +1320,7 @@ dependencies = [
  "agent_memos",
  "anyhow",
  "memos_core",
+ "qdrant-client",
  "reqwest",
  "serde",
  "serde_json",

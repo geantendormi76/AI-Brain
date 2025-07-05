@@ -2,38 +2,68 @@
 
 use serde_json::Value;
 
-// get_intent_classification_messages 函数本身是正确的，保持不变
 pub fn get_intent_classification_messages(user_query: &str) -> Vec<Value> {
-    let system_prompt = r#"You are a strict binary classifier. Your task is to classify the user's query into `SaveIntent` or `RecallIntent`.
+    let system_prompt = r#"You are a task decomposer. Your job is to analyze the user's query and break it down into a list of one or more specific tasks: `SaveIntent` or `RecallIntent`. You must identify the core text associated with each task.
 
-**Decision Logic (Follow these steps in order):**
+**Decision Logic:**
+1.  Identify all parts of the query that ask to recall, find, or search for information. For each, create a `RecallIntent` task with the relevant query text.
+2.  Identify all parts of the query that ask to save, remember, or take note of information. For each, create a `SaveIntent` task with the relevant fact.
+3.  If a part of the query serves both purposes, create two separate tasks.
 
-**Step 1: Check for Recall Intent.**
-Does the query meet ANY of the following criteria?
-- It is phrased as a direct question (ending with '？' or '?').
-- It contains explicit query keywords like "查询", "查找", "搜索", "是什么", "如何", "为什么".
-- It asks for an introduction or explanation (e.g., "介绍一下...", "解释一下...").
-
-*   **If YES, the intent is `RecallIntent`. Stop here.**
-
-**Step 2: Check for Save Intent.**
-Does the query contain explicit command keywords like "记一下", "记录", "别忘了", "提醒我"?
-
-*   **If YES, the intent is `SaveIntent`. Stop here.**
-
-**Step 3: Default to Save Intent.**
-If the query does not meet any of the criteria in Step 1 or Step 2, it is a statement of fact or an instruction to be remembered.
-
-*   **The intent is `SaveIntent`.**
-
-**Your Output MUST be a valid JSON object:**
+**Your Output MUST be a valid JSON object with a list of tasks:**
 ```json
 {
-  "intent": "string, one of [SaveIntent, RecallIntent]"
+  "tasks": [
+    {
+      "intent": "string, one of [SaveIntent, RecallIntent]",
+      "text": "string, the specific text for this task"
+    }
+  ]
 }
 ```
-**No other text or explanations.**
-"#;
+
+**Examples:**
+<user_input>我最喜欢什么编程语言？</user_input>
+<assistant_response>
+{
+"tasks": [
+{
+"intent": "RecallIntent",
+"text": "我最喜欢什么编程语言？"
+}
+]
+}
+</assistant_response>
+
+<user_input>帮我记一下：项目Alpha的截止日期是下周五。</user_input>
+<assistant_response>
+{
+"tasks": [
+{
+"intent": "SaveIntent",
+"text": "项目Alpha的截止日期是下周五。"
+}
+]
+}
+</assistant_response>
+
+<user_input>帮我查一下“项目Alpha”的最新进度，并记一下我下周要跟进。</user_input>
+<assistant_response>
+{
+"tasks": [
+{
+"intent": "RecallIntent",
+"text": "“项目Alpha”的最新进度"
+},
+{
+"intent": "SaveIntent",
+"text": "我下周要跟进“项目Alpha”。"
+}
+]
+}
+</assistant_response>
+
+Now, decompose the user's query into a JSON task list."#;
 
     vec![
         serde_json::json!({"role": "system", "content": system_prompt}),
@@ -41,9 +71,14 @@ If the query does not meet any of the criteria in Step 1 or Step 2, it is a stat
     ]
 }
 
-// *** 这是最终的、极度精简的、单行 GBNF Schema ***
-// 我们不再定义复杂的规则，而是直接将结构写死。
-// 这是为了最大限度地保证解析成功。
 pub fn get_intent_gbnf_schema() -> &'static str {
-    "root ::= \"{\" [ \\t\\n\\r]* \"\\\"intent\\\"\" [ \\t\\n\\r]* \":\" [ \\t\\n\\r]* (\"\\\"SaveIntent\\\"\" | \"\\\"RecallIntent\\\"\") [ \\t\\n\\r]* \"}\""
+    r#"root ::= "{" ws "\"tasks\":" ws "[" ws task (ws "," ws task)* ws "]" ws "}"
+task ::= "{" ws "\"intent\":" ws "\"" ("SaveIntent" | "RecallIntent") "\"" ws "," ws "\"text\":" ws string ws "}"
+string ::= "\"" (
+  [^"\\] |
+  "\\" (["\\/bfnrt] | "u" [0-9a-fA-F] [0-9a-fA-F] [0-9a-fA-F] [0-9a-fA-F])
+)* "\""
+ws ::= [ \t\n\r]*"#
 }
+
+

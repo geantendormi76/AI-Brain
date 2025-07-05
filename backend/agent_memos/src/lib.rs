@@ -28,7 +28,7 @@ struct EmbeddingResponse(Vec<EmbeddingData>);
 
 type DbPool = Pool<SqliteConnectionManager>;
 const COLLECTION_NAME: &str = "memos";
-const EMBEDDING_DIM: u64 = 1024; 
+const EMBEDDING_DIM: u64 = 512; 
 
 pub struct MemosAgent {
     sql_pool: DbPool,
@@ -135,102 +135,80 @@ impl MemosAgent {
     }
 
     // --- 全新的 `recall` 方法，零LLM调用 ---
-    pub async fn recall(&self, query_text: &str) -> Result<Response, anyhow::Error> {
-        println!("[MemosAgent] Recalling V2.1 for: '{}'", query_text);
-        
-        // 步骤 1: 使用 QueryExpander 生成查询变体
+    pub async fn recall(&self, query_text: &str) -> Result<Vec<ScoredPoint>, anyhow::Error> {
+        println!("[MemosAgent] Recalling V2.2 for: '{}'", query_text);
+
         let expansions = self.query_expander.expand(query_text);
         let original_query = expansions.get(0).unwrap_or(&query_text.to_string()).clone();
-        // 将所有扩展（包括原始查询）连接成一个字符串，用于扩展向量搜索
         let expanded_query_str = expansions.join(" ");
 
+        // 修正：提高阈值以进行更严格的过滤。这是一个需要根据模型和数据进行调整的经验值。
+        const VECTOR_SCORE_THRESHOLD: f32 = 0.5;
+
         // 步骤 2: 三路并行检索
-        let (vec_original_res, vec_expanded_res, keyword_res) = tokio::try_join!(
+        let (vec_original_res, vec_expanded_res, keyword_scroll_res) = tokio::try_join!(
             // 第一路: 原始查询的向量搜索 (高精度)
             async {
                 let vector = self.get_embedding(&original_query).await?;
                 self.qdrant_client.search_points(
-                    SearchPointsBuilder::new(COLLECTION_NAME, vector, 5).with_payload(true)
+                    SearchPointsBuilder::new(COLLECTION_NAME, vector, 5)
+                        .with_payload(true)
+                        // 修正：使用正确的 API 方法名 score_threshold
+                        .score_threshold(VECTOR_SCORE_THRESHOLD)
                 ).await.map_err(|e| anyhow::anyhow!("Original vector search failed: {}", e))
             },
             // 第二路: 扩展查询的向量搜索 (高召回)
             async {
                 let vector = self.get_embedding(&expanded_query_str).await?;
                 self.qdrant_client.search_points(
-                    SearchPointsBuilder::new(COLLECTION_NAME, vector, 5).with_payload(true)
+                    SearchPointsBuilder::new(COLLECTION_NAME, vector, 5)
+                        .with_payload(true)
+                        // 修正：使用正确的 API 方法名 score_threshold
+                        .score_threshold(VECTOR_SCORE_THRESHOLD)
                 ).await.map_err(|e| anyhow::anyhow!("Expanded vector search failed: {}", e))
             },
             // 第三路: 关键词搜索 (补充精确匹配)
             async {
                 let keywords = self.extract_keywords(query_text);
-                if keywords.is_empty() { return Ok(vec![]); } 
+                if keywords.is_empty() {
+                    // 如果没有关键词，返回一个空的 Ok(None) 来匹配类型
+                    return Ok(None);
+                }
                 use qdrant_client::qdrant::{r#match::MatchValue, Condition, Filter};
                 let filter = Filter::must(keywords.iter().map(|k| Condition::matches("content", MatchValue::Text(k.clone()))));
+                // 修正：返回原始的 ScrollResponse，而不是预处理它
                 let scroll_response = self.qdrant_client.scroll(
                     qdrant_client::qdrant::ScrollPointsBuilder::new(COLLECTION_NAME).filter(filter).limit(5).with_payload(true)
                 ).await.map_err(|e| anyhow::anyhow!("Keyword search failed: {}", e))?;
-                // 将关键词搜索结果包装成 ScoredPoint 以便融合
-                Ok(scroll_response.result.into_iter().map(|p: qdrant_client::qdrant::RetrievedPoint| {
-                    ScoredPoint {
-                        id: p.id,
-                        payload: p.payload,
-                        score: 1.0,
-                        version: 0, // 修正：RetrievedPoint中没有version字段，我们为其提供一个默认值0
-                        vectors: p.vectors,
-                        order_value: p.order_value,
-                        shard_key: p.shard_key,
-                    }
-                }).collect())
+                // 使用 Some 包装，以便与向量搜索的 Option<ScrollResponse> 类型匹配（虽然向量搜索不会返回None，但这样类型更安全）
+                Ok(Some(scroll_response))
             }
         )?;
 
+        // 修正：在 try_join! 之后，统一处理所有召回结果
+        let mut all_results: Vec<Vec<ScoredPoint>> = Vec::new();
+        all_results.push(vec_original_res.result);
+        all_results.push(vec_expanded_res.result);
+        if let Some(scroll_res) = keyword_scroll_res {
+            let keyword_points = scroll_res.result.into_iter().map(|p: qdrant_client::qdrant::RetrievedPoint| {
+                ScoredPoint {
+                    id: p.id,
+                    payload: p.payload,
+                    score: 1.0, // 关键词匹配结果的 RRF 基础分设为 1.0
+                    version: 0,
+                    vectors: p.vectors,
+                    order_value: p.order_value,
+                    shard_key: p.shard_key,
+                }
+            }).collect();
+            all_results.push(keyword_points);
+        }
+
         // 步骤 3: RRF融合三路结果
-        let all_results: Vec<Vec<ScoredPoint>> = vec![
-            vec_original_res.result.clone(), 
-            vec_expanded_res.result, 
-            keyword_res.clone()
-        ];
         let fused_points = self.reciprocal_rank_fusion_multi(all_results, 60);
-        
-        // 步骤 4: 动态阈值过滤 (保持不变)
         let filtered_points = self.apply_dynamic_threshold(fused_points);
 
-        if filtered_points.is_empty() {
-            return Ok(Response::Text("关于这个，我好像没什么印象...".to_string()));
-        }
-
-        // 步骤 5: 高置信度判断 (保持不变)
-        if !filtered_points.is_empty() {
-            // 获取融合后的Top-1结果的ID
-            if let Some(top_id) = filtered_points[0].id.as_ref().and_then(|p| p.point_id_options.as_ref()) {
-                // 检查这个ID是否存在于原始向量搜索的结果中
-                let in_vector_results = vec_original_res.result.iter().any(|p| p.id.as_ref().and_then(|pi| pi.point_id_options.as_ref()) == Some(top_id));
-                // 检查这个ID是否存在于关键词搜索的结果中
-                let in_keyword_results = keyword_res.iter().any(|p| p.id.as_ref().and_then(|pi| pi.point_id_options.as_ref()) == Some(top_id));
-
-                // 如果Top-1结果同时被向量和关键词找到，则认为是高置信度匹配
-                if in_vector_results && in_keyword_results {
-                    if let Some(content) = filtered_points[0].payload.get("content").and_then(|v| v.as_str()) {
-                        println!("[MemosAgent] High confidence (vector+keyword consensus) match found. Returning directly.");
-                        return Ok(Response::Text(content.to_string()));
-                    }
-                }
-            }
-        }
-
-        // 步骤 6: 低置信度时的处理 (保持不变)
-        println!("[MemosAgent] Low confidence matches. Returning summary.");
-        let top_results_summary: Vec<String> = filtered_points.iter().take(3).filter_map(|p| {
-            p.payload.get("content").and_then(|v| v.as_str()).map(|s| format!("- {}", s))
-        }).collect();
-
-        let response_text = format!(
-            "关于“{}”，我没有找到直接的记忆，但发现了一些可能相关的内容：\n{}",
-            query_text,
-            top_results_summary.join("\n")
-        );
-
-        Ok(Response::Text(response_text))
+        Ok(filtered_points)
     }
 
     // --- 保持不变的辅助函数 ---
@@ -314,13 +292,11 @@ impl Agent for MemosAgent {
     self}
 
     async fn handle_command(&self, command: &Command) -> Result<Response, anyhow::Error> {
-        // 这个函数现在只是一个简单的分发器，实际逻辑在 save 和 recall 中
-        // Orchestrator 将直接调用 save 和 recall，所以这个函数可能不会被直接使用
-        // 但为了满足Agent trait，我们保留一个简单的实现
+        // 这个函数在V2.2架构中不应被直接调用。
+        // 我们提供一个默认的回退行为以满足trait的编译要求。
         match command {
-            Command::ProcessText(text) => {
-                // 默认行为是回忆
-                self.recall(text).await
+            Command::ProcessText(_) => {
+                Ok(Response::Text("This agent should be called via its specific methods (save/recall), not handle_command.".to_string()))
             }
         }
     }
