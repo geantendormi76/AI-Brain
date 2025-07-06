@@ -9,21 +9,20 @@ pub fn init_db(pool: &DbPool) -> Result<()> {
     // 从连接池中获取一个连接
     let conn = pool.get().expect("Failed to get DB connection from pool");
     
-    // 创建 'facts' 表，如果它不存在的话
-    // 我们在这里预留了未来需要的字段
+    // V5.0 升级：创建 'facts' 表，增加 expires_at 和 metadata 字段
+    // id 已经是主键，我们确保它自增
     conn.execute(
         "CREATE TABLE IF NOT EXISTS facts (
-            id INTEGER PRIMARY KEY,
-            type TEXT NOT NULL,
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
             content TEXT NOT NULL,
             metadata TEXT,
-            status TEXT NOT NULL DEFAULT 'active',
+            expires_at DATETIME,
             created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
             updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
         )",
         [],
     )?;
 
-    println!("[MemosAgent-DB] Database initialized and 'facts' table created.");
+    println!("[MemosAgent-DB] Database initialized and 'facts' table created/updated for V5.0.");
     Ok(())
 }

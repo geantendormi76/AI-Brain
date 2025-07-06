@@ -1,15 +1,17 @@
 // agent_memos/src/lib.rs
 
-mod query_expander; // 声明新模块
-use query_expander::QueryExpander; // 导入 QueryExpander
-// use 声明也相应简化
+// 1. 导入 db 模块
+mod db; 
+mod query_expander;
+use query_expander::QueryExpander;
 use memos_core::{Agent, Command, Response};
 use async_trait::async_trait;
 use r2d2_sqlite::SqliteConnectionManager;
 use r2d2::Pool;
 use chrono::Utc;
 use std::collections::HashMap;
-use qdrant_client::qdrant::{PointStruct, Vector, VectorParamsBuilder, CreateCollectionBuilder, Distance, UpsertPointsBuilder, SearchPointsBuilder, ScoredPoint, point_id, vector::Vector as QdrantVectorEnums, DenseVector};
+// 2. 导入 qdrant 删除点所需的新类型
+use qdrant_client::qdrant::{PointStruct, Vector, VectorParamsBuilder, CreateCollectionBuilder, Distance, UpsertPointsBuilder, SearchPointsBuilder, ScoredPoint, point_id, vector::Vector as QdrantVectorEnums, DenseVector, PointsIdsList, DeletePointsBuilder};
 use qdrant_client::{Payload, Qdrant};
 use serde_json::json;
 use std::any::Any;
@@ -33,7 +35,7 @@ const EMBEDDING_DIM: u64 = 512;
 pub struct MemosAgent {
     sql_pool: DbPool,
     qdrant_client: Qdrant,
-    query_expander: QueryExpander, // 新增字段
+    query_expander: QueryExpander,
 }
 
 impl MemosAgent {
@@ -44,12 +46,10 @@ impl MemosAgent {
         let sql_db_path = db_dir.join("memos.db");
         let manager = SqliteConnectionManager::file(sql_db_path);
         let sql_pool = Pool::new(manager)?;
-        let conn = sql_pool.get()?;
-        conn.execute(
-            "CREATE TABLE IF NOT EXISTS facts (id INTEGER PRIMARY KEY, content TEXT NOT NULL, created_at TEXT NOT NULL)",
-            [],
-        )?;
-        println!("[MemosAgent-DB] SQLite database initialized.");
+        
+        // 3. 【核心改造】调用统一的 db::init_db，移除旧的建表逻辑
+        db::init_db(&sql_pool)?;
+        println!("[MemosAgent-DB] SQLite database initialization delegated to db::init_db.");
 
         let qdrant_client = Qdrant::from_url(qdrant_url).build()?;
         println!("[MemosAgent-DB] Qdrant client initialized.");
@@ -209,6 +209,59 @@ impl MemosAgent {
         let filtered_points = self.apply_dynamic_threshold(fused_points);
 
         Ok(filtered_points)
+    }
+
+    // 4. 【新增】update 方法
+    pub async fn update(&self, id: i64, new_content: &str) -> Result<(), anyhow::Error> {
+        println!("[MemosAgent] Updating memo ID: {}", id);
+        use rusqlite::params; // 导入 params! 宏
+
+        // 更新 SQLite
+        let conn = self.sql_pool.get()?;
+        let now = Utc::now().to_rfc3339();
+        // 修正 #1: 使用 rusqlite::params! 宏，更安全、更清晰
+        conn.execute(
+            "UPDATE facts SET content = ?1, updated_at = ?2 WHERE id = ?3",
+            params![new_content, now, id],
+        )?;
+        println!("[MemosAgent-DB] Updated SQLite for ID: {}", id);
+
+        // 更新 Qdrant (通过重新 Upsert)
+        let vector_data = self.get_embedding(new_content).await?;
+        let qdrant_vector = Vector {
+            vector: Some(QdrantVectorEnums::Dense(DenseVector { data: vector_data })),
+            ..Default::default()
+        };
+        let payload: Payload = json!({"content": new_content, "updated_at": now}).try_into()?;
+        let point = PointStruct::new(id as u64, qdrant_vector, payload);
+        self.qdrant_client.upsert_points(UpsertPointsBuilder::new(COLLECTION_NAME.to_string(), vec![point])).await?;
+        println!("[MemosAgent-DB] Re-upserted point to Qdrant for ID: {}", id);
+
+        Ok(())
+    }
+
+    // 5. 【最终修正】delete 方法
+    pub async fn delete(&self, id: i64) -> Result<(), anyhow::Error> {
+        println!("[MemosAgent] Deleting memo ID: {}", id);
+        use rusqlite::params;
+
+        // 从 SQLite 删除
+        let conn = self.sql_pool.get()?;
+        conn.execute("DELETE FROM facts WHERE id = ?1", params![id])?;
+        println!("[MemosAgent-DB] Deleted from SQLite for ID: {}", id);
+
+        // 从 Qdrant 删除
+        let point_id_to_delete = point_id::PointIdOptions::Num(id as u64);
+        let points_list = PointsIdsList { ids: vec![point_id_to_delete.into()] };
+        
+        self.qdrant_client.delete_points(
+            DeletePointsBuilder::new(COLLECTION_NAME.to_string())
+                // 修正：直接传递 points_list，移除最后的 .into()
+                .points(points_list) 
+        ).await?;
+        println!("[MemosAgent-DB] Deleted point from Qdrant for ID: {}", id);
+
+        Ok(())
     }
 
     // --- 保持不变的辅助函数 ---
