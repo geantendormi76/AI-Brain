@@ -18,7 +18,8 @@ use experts::memos_agent::{
     confirmation_expert,
     re_ranker::{ReRanker, ReRankRequest, DocumentToRank, ReRankStrategy},
 };
-
+use std::fs::OpenOptions;
+use std::io::Write;
 
 #[derive(Debug, Clone)]
 pub enum PendingActionType {
@@ -69,6 +70,7 @@ pub struct Orchestrator {
     reranker: Option<ReRanker>,
     pending_action: Arc<Mutex<Option<PendingAction>>>,
     last_interaction_context: Arc<Mutex<Option<InteractionContext>>>,
+    last_full_interaction: Arc<Mutex<Option<(String, String)>>>, 
 }
 
 
@@ -89,6 +91,7 @@ impl Orchestrator {
             reranker,
             pending_action: Arc::new(Mutex::new(None)),
             last_interaction_context: Arc::new(Mutex::new(None)),
+            last_full_interaction: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -337,69 +340,91 @@ impl Orchestrator {
     }
 
 
+    pub fn handle_feedback(&self) {
+        if let Some((user_input, assistant_response)) = self.last_full_interaction.lock().unwrap().as_ref() {
+            // 定义我们希望的训练数据格式
+            let feedback_data = json!({
+                "instruction": user_input,
+                "input": "", // 对于工具调用微调，这个字段通常为空
+                "output": format!("// TODO: Add the expected correct tool call JSON here.\n// Assistant's wrong response was: {}", assistant_response),
+            });
+
+            // 打开或创建一个名为 feedback.jsonl 的文件，以追加模式写入
+            if let Ok(mut file) = OpenOptions::new()
+                .create(true)
+                .write(true)
+                .append(true)
+                .open("feedback.jsonl")
+            {
+                // 将JSON对象转换为字符串，并在末尾加上换行符
+                if let Ok(line) = serde_json::to_string(&feedback_data) {
+                    if writeln!(file, "{}", line).is_ok() {
+                        println!("[Feedback] Successfully saved feedback to feedback.jsonl");
+                    }
+                }
+            }
+        } else {
+            println!("[Feedback] No last interaction found to provide feedback on.");
+        }
+    }
+
+
+
     pub async fn dispatch(&self, command: &Command) -> Result<Response, anyhow::Error> {
         match command {
             Command::ProcessText(text) => {
                 // --- 升级后的确定性规则路由 ---
-
-                // 规则0: 检查上下文修正意图 (最高优先级)
                 let correction_keywords = ["不对", "错了", "不是", "应该是"];
                 if correction_keywords.iter().any(|&kw| text.contains(kw)) {
                     let mut context_guard = self.last_interaction_context.lock().unwrap();
-                    if let Some(context) = context_guard.take() { // 取出并消费上下文，确保只用一次
-                        
-                        // 我们只关心对上一次Save操作的修正
+                    if let Some(context) = context_guard.take() {
                         if let ContextualAction::Save { memory_id } = context.last_action {
                             println!("[Orchestrator-DST] Contextual Route: Detected correction for last saved memory ID: {}", memory_id);
-                            
                             let final_response = self.handle_contextual_modify(memory_id, text).await?;
-                            
-                            // 更新历史记录并返回
                             let mut history = self.conversation_history.lock().unwrap();
                             history.push(format!("User: {}", text));
                             history.push(format!("Assistant: {}", final_response));
+                            *self.last_full_interaction.lock().unwrap() = Some((text.to_string(), final_response.clone())); // 更新缓存
                             return Ok(Response::Text(final_response));
                         }
                     }
                 }
                 
-                // --- 保留旧的确定性规则路由 (优先级降低) ---
                 if confirmation_expert::parse_confirmation(text) != confirmation_expert::ConfirmationDecision::Unclear {
                     println!("[Orchestrator] Heuristic Route: Detected ConfirmationTool.");
                     let final_response = self.handle_confirmation(text).await?;
                     let mut history = self.conversation_history.lock().unwrap();
                     history.push(format!("User: {}", text));
                     history.push(format!("Assistant: {}", final_response));
+                    *self.last_full_interaction.lock().unwrap() = Some((text.to_string(), final_response.clone())); // 更新缓存
                     return Ok(Response::Text(final_response));
                 }
 
                 let modify_keywords = ["修改", "改成", "更新", "编辑"];
                 if modify_keywords.iter().any(|&kw| text.contains(kw)) {
                     println!("[Orchestrator] Heuristic Route: Detected ModifyTool via keywords.");
-                    // 清除短期上下文，因为这是一个新的、无上下文的修改操作
                     *self.last_interaction_context.lock().unwrap() = None;
                     let final_response = self.handle_modify(text).await?;
                     let mut history = self.conversation_history.lock().unwrap();
                     history.push(format!("User: {}", text));
                     history.push(format!("Assistant: {}", final_response));
+                    *self.last_full_interaction.lock().unwrap() = Some((text.to_string(), final_response.clone())); // 更新缓存
                     return Ok(Response::Text(final_response));
                 }
 
                 let delete_keywords = ["删除", "忘掉", "去掉", "移除"];
                 if delete_keywords.iter().any(|&kw| text.contains(kw)) {
                     println!("[Orchestrator] Heuristic Route: Detected DeleteTool via keywords.");
-                    // 清除短期上下文
                     *self.last_interaction_context.lock().unwrap() = None;
                     let final_response = self.handle_delete(text).await?;
                     let mut history = self.conversation_history.lock().unwrap();
                     history.push(format!("User: {}", text));
                     history.push(format!("Assistant: {}", final_response));
+                    *self.last_full_interaction.lock().unwrap() = Some((text.to_string(), final_response.clone())); // 更新缓存
                     return Ok(Response::Text(final_response));
                 }
                 
-                // 如果没有任何规则匹配，我们才继续走下面的LLM路由流程
                 println!("[Orchestrator] No heuristic matched. Downgrading to LLM Router.");
-                // 任何进入LLM路由的非上下文操作都应该清除旧的上下文
                 *self.last_interaction_context.lock().unwrap() = None;
 
                 #[derive(Deserialize)] struct ChatChoice { message: ChatMessageContent }
@@ -467,6 +492,9 @@ impl Orchestrator {
                     history.drain(..drain_count);
                 }
                 println!("[Orchestrator] Updated history: {:?}", history);
+
+                // --- 新增：在最终返回前，更新“最后一次交互”的缓存 ---
+                *self.last_full_interaction.lock().unwrap() = Some((text.to_string(), final_response.clone()));
 
                 Ok(Response::Text(final_response))
             }

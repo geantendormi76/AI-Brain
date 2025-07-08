@@ -49,6 +49,7 @@ async fn main() -> Result<(), anyhow::Error> {
     println!("Orchestrator created.");
     println!("\n欢迎使用 Memos 智能助理 (CLI版)");
     println!("请输入您的指令 (例如: '帮我记一下明天要开会'), 输入 'exit' 或按 Ctrl+C 退出。");
+    println!("如果遇到不理想的回答，可以立即输入 /feedback 来帮助我们改进！"); // 新增一行引导
 
     let mut rl = DefaultEditor::new()?;
 
@@ -63,6 +64,23 @@ async fn main() -> Result<(), anyhow::Error> {
                 if input.eq_ignore_ascii_case("exit") {
                     break;
                 }
+
+                // --- 新增：处理反馈指令 ---
+                if input.eq_ignore_ascii_case("/feedback") {
+                    orchestrator.handle_feedback(); // 调用反馈处理逻辑
+                    println!("\n[助理]:");
+                    println!("感谢您的反馈！");
+                    println!("> 已将上一轮不理想的交互记录，保存到了您程序目录下的 `feedback.jsonl` 文件中。");
+                    println!("> 如果您愿意帮助我改进，可以将这个文件通过");
+                    println!("> 邮箱：geantendormi89@gmail.com"); // 已更新为您的邮箱并修正拼写
+                    println!("> 微信：geantendormi"); // 已更新为您的微信
+                    println!("> 发送给我们。");
+                    println!("> 您的每一次反馈，都是我变得更智能的动力！");
+                    println!(); // 增加一个空行，保持格式美观
+                    continue; // 处理完反馈后，跳过本次循环的后续部分
+                }
+                // --- 反馈指令处理结束 ---
+
                 let _ = rl.add_history_entry(input);
 
                 let command = Command::ProcessText(input.to_string());
