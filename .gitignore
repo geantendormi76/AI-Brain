@@ -1,6 +1,7 @@
 # 忽略根目录的 target 文件夹（即 AI/target/）
 /target/
 /llama.cpp/
+/src-tauri/
 
 # 忽略所有子目录下的 target 文件夹
 **/target/
@@ -15,3 +16,4 @@ backend/qdrant
 backend/storage/
 backend/snapshots/
 backend/.qdrant-initialized
+backend/feedback.jsonl
