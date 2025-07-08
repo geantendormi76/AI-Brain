@@ -1356,6 +1356,7 @@ dependencies = [
  "anyhow",
  "memos_core",
  "qdrant-client",
+ "regex",
  "reqwest",
  "serde",
  "serde_json",

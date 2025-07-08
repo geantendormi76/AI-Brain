@@ -114,8 +114,7 @@ impl MemosAgent {
     }
 
 
-    // --- `save` 方法保持核心逻辑，但可以简化，因为它总是被调用
-    pub async fn save(&self, content: &str) -> Result<(), anyhow::Error> {
+    pub async fn save(&self, content: &str) -> Result<i64, anyhow::Error> {
         println!("[MemosAgent] Saving memo: '{}'", content);
         let conn = self.sql_pool.get()?;
         let now = Utc::now().to_rfc3339();
@@ -131,7 +130,7 @@ impl MemosAgent {
         let points = vec![PointStruct::new(memo_id as u64, qdrant_vector, payload)];
         self.qdrant_client.upsert_points(UpsertPointsBuilder::new(COLLECTION_NAME.to_string(), points)).await?;
         println!("[MemosAgent-DB] Upserted point to Qdrant with ID: {}", memo_id);
-        Ok(())
+        Ok(memo_id)
     }
 
     // --- 全新的 `recall` 方法，零LLM调用 ---
@@ -262,6 +261,19 @@ impl MemosAgent {
         println!("[MemosAgent-DB] Deleted point from Qdrant for ID: {}", id);
 
         Ok(())
+    }
+
+    pub async fn get_by_id(&self, id: i64) -> Result<Option<String>, anyhow::Error> {
+        let conn = self.sql_pool.get()?;
+        let mut stmt = conn.prepare("SELECT content FROM facts WHERE id = ?1")?;
+        let mut rows = stmt.query_map([id], |row| row.get(0))?;
+
+        if let Some(content_result) = rows.next() {
+            let content: String = content_result?;
+            Ok(Some(content))
+        } else {
+            Ok(None)
+        }
     }
 
     // --- 保持不变的辅助函数 ---

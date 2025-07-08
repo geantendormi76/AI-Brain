@@ -13,8 +13,8 @@ pub fn parse_confirmation(text: &str) -> ConfirmationDecision {
     let lower_text = text.trim().to_lowercase();
 
     // 定义肯定和否定的关键词
-    let affirm_keywords = ["yes", "ok", "confirm", "y", "是的", "确认", "好的", "对", "中", "是"];
-    let deny_keywords = ["no", "cancel", "n", "不是", "不用了", "取消", "否"];
+    let affirm_keywords = ["yes", "ok", "confirm", "y", "是的", "确认", "好的", "对", "中", "是", "确定", "好"];
+    let deny_keywords = ["no", "cancel", "n", "不是", "不用了", "取消", "否", "不"];
 
     if affirm_keywords.iter().any(|&s| lower_text == s) {
         return ConfirmationDecision::Affirm;
