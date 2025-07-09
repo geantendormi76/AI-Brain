@@ -1,11 +1,19 @@
 {
   "$schema": "../gen/schemas/desktop-schema.json",
-  "identifier": "default",
-  "description": "enables the default permissions",
-  "windows": [
-    "main"
-  ],
+  "identifier": "default-capability",
+  "description": "Allows spawning and killing the app's sidecar processes.",
+  "windows": ["main"],
   "permissions": [
-    "core:default"
+    "shell:allow-kill",
+    {
+      "identifier": "shell:allow-spawn",
+      "allow": [
+        { "name": "server", "sidecar": true },
+        { "name": "qdrant", "sidecar": true },
+        { "name": "llama_chat", "sidecar": true },
+        { "name": "llama_embedding", "sidecar": true },
+        { "name": "llama_rerank", "sidecar": true }
+      ]
+    }
   ]
 }
