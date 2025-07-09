@@ -1,11 +1,12 @@
-// In common_utils/src/lib.rs
+// In C:\zhzai\AI\backend\common_utils\src\lib.rs
 
-use sysinfo::{System, SystemExt};
+use serde::Deserialize;
+use sysinfo::System;
 
 // 定义一个枚举来表示不同的性能模式
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PerformanceMode {
-    QualityFirst, // 质量优先 (高配)
+    QualityFirst,     // 质量优先 (高配)
     PerformanceFirst, // 性能优先 (低配)
 }
 
@@ -31,5 +32,24 @@ pub fn detect_performance_mode() -> PerformanceMode {
     } else {
         println!("[HardwareDetector] Auto-detected: Memory is limited. Enabling Performance-First mode.");
         PerformanceMode::PerformanceFirst
+    }
+}
+
+// 定义一个统一的配置结构体
+#[derive(Debug, Clone, Deserialize)]
+pub struct ServiceUrls {
+    pub llm_url: String,
+    pub embedding_url: String,
+    pub reranker_url: Option<String>, 
+    pub qdrant_url: String,
+}
+
+// 提供一个加载默认配置的函数
+pub fn load_default_urls() -> ServiceUrls {
+    ServiceUrls {
+        llm_url: "http://localhost:8282".to_string(),
+        embedding_url: "http://localhost:8181".to_string(),
+        reranker_url: None,
+        qdrant_url: "http://localhost:6334".to_string(),
     }
 }

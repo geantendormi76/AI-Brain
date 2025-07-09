@@ -16,8 +16,7 @@ use thiserror::Error;
 use tower_http::{cors::{Any, CorsLayer}, trace::TraceLayer};
 use std::sync::Arc;
 use tokio::task; // 导入 tokio::task
-
-use common_utils::{detect_performance_mode, PerformanceMode};
+use common_utils::{detect_performance_mode, PerformanceMode, load_default_urls};
 
 // API 层 DTOs (保持不变)
 #[derive(Serialize)] #[serde(rename_all = "PascalCase")] struct ApiResponse { text: String }
@@ -75,25 +74,39 @@ async fn dispatch_handler(
 // 主函数 (保持不变)
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    // tracing_subscriber::fmt::init();
+    println!("[Server] Initializing...");
+
+    // 1. 加载所有服务的默认URL
+    let mut service_urls = load_default_urls();
+
+    // 2. 执行硬件检测，并根据结果更新配置
     println!("[Server] Detecting hardware and setting performance mode...");
-    let mode = detect_performance_mode(); // <--- 调用硬件检测
+    let mode = detect_performance_mode();
+    if mode == PerformanceMode::QualityFirst {
+        // 为高质量模式设置 Reranker URL
+        service_urls.reranker_url = Some("http://localhost:8080".to_string());
+        println!("[Server] Quality-First mode enabled. Reranker URL set.");
+    } else {
+        println!("[Server] Performance-First mode enabled. Reranker will not be used.");
+    }
 
-    // 根据模式决定 reranker 的 URL
-    let reranker_llm_url = match mode {
-        PerformanceMode::QualityFirst => Some("http://localhost:8080"),
-        PerformanceMode::PerformanceFirst => None,
-    };
-
-    println!("[Server] Initializing Orchestrator...");
-    let qdrant_url = "http://localhost:6334";
-    let llm_url = "http://localhost:8282"; 
-    let reranker_llm_url = None;
-    let memos_agent = MemosAgent::new(qdrant_url).await?;
+    // 3. 使用配置来初始化所有模块
+    println!("[Server] Initializing MemosAgent...");
+    let memos_agent = MemosAgent::new(
+        &service_urls.qdrant_url, 
+        &service_urls.embedding_url
+    ).await?;
     let agents: Vec<Box<dyn memos_core::Agent>> = vec![Box::new(memos_agent)];
     
-    // 将检测到的配置传递给 Orchestrator
-    let orchestrator = Orchestrator::new(agents, llm_url, reranker_llm_url);
+    println!("[Server] Initializing Orchestrator...");
+    // 4. 将完整的配置传递给 Orchestrator
+    // 注意：您需要修改 Orchestrator::new 的签名来接收这些URL
+    // 假设 Orchestrator::new 的签名是 new(agents, llm_url, reranker_url)
+    let orchestrator = Orchestrator::new(
+        agents, 
+        &service_urls.llm_url, 
+        service_urls.reranker_url.as_deref() // 使用 as_deref() 将 Option<String> 转为 Option<&str>
+    );
 
     let shared_state = Arc::new(orchestrator);
     println!("[Server] Orchestrator initialized.");
@@ -104,8 +117,9 @@ async fn main() -> anyhow::Result<()> {
         .layer(CorsLayer::new().allow_origin(Any).allow_methods(Any))
         .layer(TraceLayer::new_for_http());
 
-    let listener = tokio::net::TcpListener::bind("0.0.0.0:8282").await?;
-    println!("[Server] Listening on http://{}", listener.local_addr()?);
+    // 5. 使用新的、无冲突的端口启动API服务器
+    let listener = tokio::net::TcpListener::bind("0.0.0.0:8383").await?;
+    println!("[Server] API Gateway listening on http://{}", listener.local_addr()?);
     axum::serve(listener, app).await?;
     
     Ok(())

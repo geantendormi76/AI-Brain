@@ -2,6 +2,9 @@
 
 [workspace]
 resolver = "2" # 使用最新的依赖解析器
+
+
+
 members = [
     # 我们的新 Web 服务器入口
     "server",
@@ -14,5 +17,3 @@ members = [
     "memos_cli", 
     "common_utils",
 ]
-
-# 注意：这个文件里不应该有 [dependencies] 或 [package] 部分

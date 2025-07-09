@@ -36,10 +36,12 @@ pub struct MemosAgent {
     sql_pool: DbPool,
     qdrant_client: Qdrant,
     query_expander: QueryExpander,
+    embedding_url: String, // <-- 新增字段
 }
 
+
 impl MemosAgent {
-    pub async fn new(qdrant_url: &str) -> Result<Self, anyhow::Error> {
+    pub async fn new(qdrant_url: &str, embedding_url: &str) -> Result<Self, anyhow::Error> {
         let home_dir = dirs::home_dir().ok_or_else(|| anyhow::anyhow!("Could not find home directory"))?;
         let db_dir = home_dir.join(".memos_agent");
         std::fs::create_dir_all(&db_dir)?;
@@ -69,7 +71,8 @@ impl MemosAgent {
         Ok(Self { 
             sql_pool, 
             qdrant_client,
-            query_expander: QueryExpander::new(), // 初始化 QueryExpander
+            query_expander: QueryExpander::new(),
+            embedding_url: embedding_url.to_string(), 
         })
     }
 
@@ -280,8 +283,7 @@ impl MemosAgent {
     async fn get_embedding(&self, text: &str) -> Result<Vec<f32>, anyhow::Error> {
         println!("[MemosAgent-Embed] Requesting vector for text: '{}'", text);
         let client = reqwest::Client::new();
-        let embedding_url = "http://localhost:8181/embedding";
-        let response = client.post(embedding_url).json(&EmbeddingRequest { content: text }).send().await?;
+        let response = client.post(&self.embedding_url).json(&EmbeddingRequest { content: text }).send().await?;
         if !response.status().is_success() {
             let error_body = response.text().await?;
             return Err(anyhow::anyhow!("Embedding service returned an error: {}", error_body));
