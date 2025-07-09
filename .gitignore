@@ -98,7 +98,12 @@ rust-toolchain.toml
 # =================================================================
 # Ignore large model files
 /models/
-
+/binaries/ 
+binaries/                                    
+frontend/instant_assistant/src-tauri/binaries/ 
+frontend/instant_assistant/src-tauri/models/   
+frontend/instant_assistant/src-tauri/storage/ 
+frontend/instant_assistant/src-tauri/.qdrant-initialized 
 # Ignore generated analysis files
 /backend/project_analysis.json
 

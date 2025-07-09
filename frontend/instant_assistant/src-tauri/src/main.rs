@@ -84,4 +84,3 @@ fn main() {
                 println!("[Tauri] All sidecar processes terminated.");
             }
         });
-}
