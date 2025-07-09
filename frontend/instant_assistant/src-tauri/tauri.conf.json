@@ -3,18 +3,32 @@
   "productName": "AI-Brain",
   "version": "0.1.0",
   "identifier": "com.tauri.dev",
+
+  "build": {
+    "devUrl": "http://localhost:3000",
+    "frontendDist": "../build/flutter",
+    "beforeDevCommand": "flutter run --no-pub -d windows"
+  },
+
   "bundle": {
     "active": true,
     "targets": "all",
-    "icon": ["icons/32x32.png", "icons/128x128.png", "icons/128x128@2x.png", "icons/icon.icns", "icons/icon.ico"],
-  "externalBin": [
-    "binaries/server",
-    "binaries/qdrant",
-    "binaries/llama_chat",
-    "binaries/llama_embedding",
-    "binaries/llama_rerank"
-  ],
+    "icon": [
+      "icons/32x32.png",
+      "icons/128x128.png",
+      "icons/128x128@2x.png",
+      "icons/icon.icns",
+      "icons/icon.ico"
+    ],
+    "externalBin": [
+      "binaries/server",
+      "binaries/qdrant",
+      "binaries/llama_chat",
+      "binaries/llama_embedding",
+      "binaries/llama_rerank"
+    ],
     "resources": [
       "models"
     ]
-}}
+  }
+}
