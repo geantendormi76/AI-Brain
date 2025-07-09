@@ -108,7 +108,7 @@ rust-toolchain.toml
 /backend/storage/
 /backend/snapshots/
 /agent_memos/memos.db # Example, adjust if needed
-/llama.cpp/
+llama.cpp/
 
 # Ignore feedback files
 /backend/feedback.jsonl
