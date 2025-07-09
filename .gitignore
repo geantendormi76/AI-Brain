@@ -112,3 +112,17 @@ llama.cpp/
 
 # Ignore feedback files
 /backend/feedback.jsonl
+
+
+# =================================================================
+# Tauri Runtime Generated Files (add this section)
+# =================================================================
+# Ignore all binaries inside src-tauri, even if renamed
+/src-tauri/binaries/
+
+# Ignore all models inside src-tauri
+/src-tauri/models/
+
+# Ignore runtime data and flag files
+/src-tauri/storage/
+/src-tauri/.qdrant-initialized
