@@ -1,0 +1,25 @@
+# In ~/AI/backend/server/Cargo.toml
+[package]
+name = "server"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+# Web 框架和异步运行时
+axum = { version = "0.7.5", features = ["macros"] }
+tokio = { version = "1.0", features = ["full"] }
+tower-http = { version = "0.5.2", features = ["cors", "trace"] }
+tracing-subscriber = "0.3" # 用于日志
+
+# 序列化/反序列化
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
+# 错误处理
+thiserror = "1.0"
+anyhow = "1.0"
+common_utils = { path = "../common_utils" }
+# 关键：依赖我们工作区内的其他成员
+orchestrator = { path = "../orchestrator" }
+agent_memos = { path = "../agent_memos" }
+memos_core = { path = "../memos_core" }

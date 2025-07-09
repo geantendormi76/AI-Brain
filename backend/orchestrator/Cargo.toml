@@ -4,10 +4,7 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-# 调度器需要认识“合同”
 memos_core = { path = "../memos_core" }
-
-# 调度器需要认识“Memos专家”
 agent_memos = { path = "../agent_memos" }
 
 # 其他通用依赖

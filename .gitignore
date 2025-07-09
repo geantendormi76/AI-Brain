@@ -1,19 +1,113 @@
-# 忽略根目录的 target 文件夹（即 AI/target/）
-/target/
-/llama.cpp/
-/src-tauri/
-
-# 忽略所有子目录下的 target 文件夹
-**/target/
-
-# 忽略IDE/编辑器相关的配置文件
+# =================================================================
+# General
+# =================================================================
+# IDE and editor configurations
 .idea/
 .vscode/
+*.iml
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
 
-# 新增：忽略您不想提交的文件和目录，需要加上 backend/ 前缀
-backend/project_analysis.json
-backend/qdrant
-backend/storage/
-backend/snapshots/
-backend/.qdrant-initialized
-backend/feedback.jsonl
+# OS-generated files
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+
+# = a fresh start with git
+# =================================================================
+# Rust / Cargo
+# =================================================================
+# Compiled output
+/target/
+# Ignore all target directories in subprojects as well
+**/target/
+
+# Generated Cargo lock file
+Cargo.lock
+
+# Rust toolchain files
+rust-toolchain
+rust-toolchain.toml
+
+# Rider-specific files
+.idea/
+/out/
+
+# =================================================================
+# Flutter / Dart
+# =================================================================
+# Flutter/Dart/Pub-related
+.dart_tool/
+.flutter-plugins
+.flutter-plugins-dependencies
+.packages
+.pub-cache/
+.pub/
+/build/
+
+# IDE-specific
+.idea/
+*.iml
+
+# Other
+/doc/api/
+/ios/Flutter/App.framework
+/ios/Flutter/engine
+/ios/Flutter/flutter_assets
+/ios/Flutter/Generated.xcconfig
+/ios/Flutter/pod_certs
+/ios/Flutter/Pods
+/ios/Flutter/ServiceDefinitions.json
+/ios/Runner/Assets.xcassets
+/ios/Runner/GeneratedPluginRegistrant.*
+/ios/Runner.xcworkspace
+/ios/Pods
+/ios/.symlinks
+/ios/Flutter/ephemeral
+/ios/Runner.xcodeproj/project.xcworkspace
+/ios/Runner.xcodeproj/xcshareddata/xcschemes/Runner.xcscheme
+
+/android/app/src/main/assets/flutter_assets
+/android/.gradle
+/android/app/build
+/android/build
+/android/gradle
+/android/gradlew
+/android/gradlew.bat
+/android/local.properties
+/android/.idea/
+/android/app/src/main/java/io/flutter/plugins/GeneratedPluginRegistrant.java
+.metadata
+
+# =================================================================
+# Tauri
+# =================================================================
+/src-tauri/target/
+/src-tauri/Cargo.lock
+/src-tauri/gen/
+/src-tauri/binaries/ # We should not commit the compiled binaries
+
+# =================================================================
+# Project-Specific (Your Project)
+# =================================================================
+# Ignore large model files
+/models/
+
+# Ignore generated analysis files
+/backend/project_analysis.json
+
+# Ignore local database files
+/backend/qdrant/
+/backend/qdrant-initialized
+/backend/storage/
+/backend/snapshots/
+/agent_memos/memos.db # Example, adjust if needed
+
+# Ignore feedback files
+/backend/feedback.jsonl

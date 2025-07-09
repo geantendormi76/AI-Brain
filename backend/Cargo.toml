@@ -1,14 +1,18 @@
-[workspace]
-resolver = "2"
+# In ~/AI/backend/Cargo.toml
 
+[workspace]
+resolver = "2" # 使用最新的依赖解析器
 members = [
-    "memos_core",
-    "agent_memos",
+    # 我们的新 Web 服务器入口
+    "server",
+
+    # 您所有的业务逻辑核心库
     "orchestrator",
-    "memos_cli"
+    "agent_memos",
+    "memos_core",
+    # 您之前的命令行入口 (我们保留它)
+    "memos_cli", 
+    "common_utils",
 ]
 
-[profile.release]
-lto = true
-codegen-units = 1
-strip = true
+# 注意：这个文件里不应该有 [dependencies] 或 [package] 部分
