@@ -1,19 +1,49 @@
-# In ~/AI/backend/Cargo.toml
-
 [workspace]
-resolver = "2" # 使用最新的依赖解析器
-
-
+resolver = "2"
 
 members = [
-    # 我们的新 Web 服务器入口
     "server",
-
-    # 您所有的业务逻辑核心库
     "orchestrator",
     "agent_memos",
     "memos_core",
-    # 您之前的命令行入口 (我们保留它)
     "memos_cli", 
     "common_utils",
 ]
+
+# 策略1：[patch] 强制覆盖整个依赖树，解决底层冲突。
+[patch.crates-io]
+reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "native-tls-vendored"] }
+tonic = { version = "0.11", default-features = false, features = ["transport", "codegen", "prost", "tls"] }
+hyper-tls = { version = "0.6.0" }
+
+# ======================= 【补全缺失的部分】 =======================
+# 策略2：[workspace.dependencies] 为工作区成员提供统一的、便捷的依赖声明。
+[workspace.dependencies]
+anyhow = "1.0"
+async-trait = "0.1"
+axum = { version = "0.7.5", features = ["macros"] }
+bytes = "1"
+chrono = "0.4.38"
+common_utils = { path = "common_utils" }
+dirs = "5.0"
+futures-util = { version = "0.3", features = ["io"] }
+jieba-rs = "0.6"
+memos_core = { path = "memos_core" }
+agent_memos = { path = "agent_memos" }
+orchestrator = { path = "orchestrator" }
+qdrant-client = "1.14.0"
+r2d2 = "0.8.10"
+r2d2_sqlite = "0.24.0"
+regex = "1.10.4"
+# 统一定义 reqwest
+reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "native-tls-vendored"] }
+rusqlite = { version = "0.31.0", features = ["bundled"] }
+rustyline = "14.0"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+stop-words = "0.8"
+sysinfo = "0.30.12"
+thiserror = "1.0"
+tokio = { version = "1", features = ["full"] }
+tower-http = { version = "0.5.2", features = ["cors", "trace"] }
+tracing-subscriber = "0.3"

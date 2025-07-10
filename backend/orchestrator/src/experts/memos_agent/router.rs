@@ -20,6 +20,7 @@ pub struct RoutingDecision {
 }
 
 
+
 pub fn get_routing_prompt(user_query: &str, history: &[String]) -> Vec<Value> {
     let history_context = if history.is_empty() {
         "No conversation history.".to_string()
@@ -27,26 +28,25 @@ pub fn get_routing_prompt(user_query: &str, history: &[String]) -> Vec<Value> {
         history.join("\n")
     };
 
-    // --- 新的、更严格的 System Prompt ---
+    // --- 【V2 版优化】更智能、更严格的 System Prompt ---
     let system_prompt = format!(
     r#"You are a master router. Your only job is to analyze the user's query and decide which single tool to call.
 
 **Tool Descriptions:**
-- `SaveTool`: Use when the user wants to **save, remember, record, or take note** of information. This is your primary default tool.
-- `RecallTool`: Use when the user wants to **ask a question, find, search, or recall** information. This includes implicit questions like "What are my plans for tomorrow?" or "What is...?.
-- `NoTool`: Use ONLY for greetings ("hello", "hi"), meaningless single words, or if the intent is completely impossible to understand.
+- `SaveTool`: Use when the user wants to **save, remember, record, or take note** of information.
+- `RecallTool`: Use when the user wants to **ask a question, find, search, recall, or get an explanation/definition**.
+- `ModifyTool`: Use ONLY when the user explicitly asks to **change, update, or modify** a PREVIOUSLY saved memory. Requires context from conversation history.
+- `DeleteTool`: Use ONLY when the user explicitly asks to **delete, remove, or forget** a PREVIOUSLY saved memory. Requires context.
+- `ConfirmationTool`: Use ONLY for short, direct answers to a yes/no question asked by the assistant (e.g., "yes", "no", "confirm").
+- `NoTool`: Use ONLY for greetings ("hello"), meaningless single words, or if the intent is completely impossible to understand.
 
 **CRITICAL DECISION LOGIC (in order of priority):**
-1.  **Question First**: If the query is phrased as a question (e.g., ends with a question mark, starts with "what", "how", "who", "查询"), it is ALWAYS `RecallTool`.
-2.  **Default to Save**: If the query is NOT a question, your default choice is ALWAYS `SaveTool`. Any declarative statement, observation, or thought ("Project Titan's core tech is...", "Today the weather is nice", "I feel like hotpot") should be classified as `SaveTool`.
-3.  **Exception for NoTool**: Only if the input is a simple greeting like "你好" or complete gibberish, classify it as `NoTool`.
+1.  **Confirmation First**: If the assistant just asked a yes/no question and the user gives a short confirmation/denial, it is ALWAYS `ConfirmationTool`.
+2.  **Explicit Command**: If the query contains explicit modification/deletion keywords like "修改" or "删除", and refers to a past memory, use `ModifyTool` or `DeleteTool`.
+3.  **Question / Definition Request**: If the query is a question (ends with "?", starts with "what", "how", etc.) OR asks for a definition/code (e.g., "什么是Rust", "完整get_embedding函数"), it is ALWAYS `RecallTool`.
+4.  **Default to Save**: If none of the above match, the default choice is `SaveTool`. Any declarative statement, observation, or thought should be classified as `SaveTool`.
 
-**Your Output MUST be a valid JSON object:**
-```json
-{{
-  "tool_to_call": "string, one of [SaveTool, RecallTool, NoTool]"
-}}
-```
+**Your Output MUST be a valid JSON object matching the GBNF schema.**
 
 **Conversation History (for context):**
 {}

@@ -1,10 +1,10 @@
-// In ~/AI/backend/server/src/main.rs
+// geantendormi76-ai-brain/backend/server/src/main.rs
 
 use axum::{
     debug_handler,
     extract::State,
     http::StatusCode,
-    response::{IntoResponse, Response},
+    response::{IntoResponse, Response as AxumResponse}, // 明确 Axum 的 Response 类型
     routing::post,
     Json, Router,
 };
@@ -15,32 +15,35 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use tower_http::{cors::{Any, CorsLayer}, trace::TraceLayer};
 use std::sync::Arc;
-use tokio::task; // 导入 tokio::task
+use tokio::task;
 use common_utils::{detect_performance_mode, PerformanceMode, load_default_urls};
 
-// API 层 DTOs (保持不变)
 #[derive(Serialize)] #[serde(rename_all = "PascalCase")] struct ApiResponse { text: String }
 #[derive(Deserialize)] struct ApiCommand { #[serde(rename = "ProcessText")] process_text: String }
 
-// 专业的错误处理 (保持不变)
 #[derive(Debug, Error)]
 enum ApiError {
     #[error("Orchestrator task failed")]
     TaskJoin(#[from] task::JoinError),
     #[error("Orchestrator dispatch failed")]
-    Dispatch(anyhow::Error),
+    Dispatch(#[from] anyhow::Error), // 直接从 anyhow::Error 转换
 }
 
+// ======================= 【核心修正开始】 =======================
+// 重写错误处理，使其能够打印详细的、包含根本原因的错误链
 impl IntoResponse for ApiError {
-    fn into_response(self) -> Response {
-        let error_message = self.to_string();
-        eprintln!("[Server Error] {}", error_message);
-        let body = Json(serde_json::json!({ "Text": "An internal server error occurred." }));
+    fn into_response(self) -> AxumResponse {
+        // 使用 {:#?} 格式化指令，它会递归地打印出整个错误链（chain of causes）。
+        // 这将把隐藏在 "Orchestrator dispatch failed" 这句通用信息背后的、
+        // 真正导致问题的具体错误（例如“JSON解析错误在第X行”）暴露出来。
+        eprintln!("[Server Error] Detailed error: {:#?}", self); 
+        
+        let body = Json(serde_json::json!({ "Text": "An internal server error occurred. Check the backend console for detailed logs." }));
         (StatusCode::INTERNAL_SERVER_ERROR, body).into_response()
     }
 }
+// ======================= 【核心修正结束】 =======================
 
-// Axum Handler (核心修正)
 #[debug_handler]
 async fn dispatch_handler(
     State(orchestrator): State<Arc<Orchestrator>>,
@@ -48,11 +51,9 @@ async fn dispatch_handler(
 ) -> Result<Json<ApiResponse>, ApiError> {
     let command = Command::ProcessText(payload.process_text);
 
-    // 使用 spawn_blocking 将业务逻辑移到另一个线程执行
-    // 这保证了我们的 handler 本身返回的 Future 是 Send
     let core_response = orchestrator.dispatch(&command)
         .await
-        .map_err(ApiError::Dispatch)?;
+        .map_err(ApiError::Dispatch)?; // .map_err 现在可以正确地包裹 anyhow::Error
 
     let api_response = match core_response {
         CoreResponse::Text(text) => ApiResponse { text },
@@ -62,26 +63,21 @@ async fn dispatch_handler(
     Ok(Json(api_response))
 }
 
-// 主函数 (保持不变)
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     println!("[Server] Initializing...");
 
-    // 1. 加载所有服务的默认URL
     let mut service_urls = load_default_urls();
 
-    // 2. 执行硬件检测，并根据结果更新配置
     println!("[Server] Detecting hardware and setting performance mode...");
     let mode = detect_performance_mode();
     if mode == PerformanceMode::QualityFirst {
-        // 为高质量模式设置 Reranker URL
         service_urls.reranker_url = Some("http://localhost:8080".to_string());
         println!("[Server] Quality-First mode enabled. Reranker URL set.");
     } else {
         println!("[Server] Performance-First mode enabled. Reranker will not be used.");
     }
 
-    // 3. 使用配置来初始化所有模块
     println!("[Server] Initializing MemosAgent...");
     let memos_agent = MemosAgent::new(
         &service_urls.qdrant_url, 
@@ -90,13 +86,10 @@ async fn main() -> anyhow::Result<()> {
     let agents: Vec<Box<dyn memos_core::Agent>> = vec![Box::new(memos_agent)];
     
     println!("[Server] Initializing Orchestrator...");
-    // 4. 将完整的配置传递给 Orchestrator
-    // 注意：您需要修改 Orchestrator::new 的签名来接收这些URL
-    // 假设 Orchestrator::new 的签名是 new(agents, llm_url, reranker_url)
     let orchestrator = Orchestrator::new(
         agents, 
         &service_urls.llm_url, 
-        service_urls.reranker_url.as_deref() // 使用 as_deref() 将 Option<String> 转为 Option<&str>
+        service_urls.reranker_url.as_deref()
     );
 
     let shared_state = Arc::new(orchestrator);
@@ -108,7 +101,6 @@ async fn main() -> anyhow::Result<()> {
         .layer(CorsLayer::new().allow_origin(Any).allow_methods(Any))
         .layer(TraceLayer::new_for_http());
 
-    // 5. 使用新的、无冲突的端口启动API服务器
     let listener = tokio::net::TcpListener::bind("0.0.0.0:8383").await?;
     println!("[Server] API Gateway listening on http://{}", listener.local_addr()?);
     axum::serve(listener, app).await?;
