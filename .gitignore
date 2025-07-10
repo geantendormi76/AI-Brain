@@ -131,3 +131,14 @@ llama.cpp/
 # Ignore runtime data and flag files
 /src-tauri/storage/
 /src-tauri/.qdrant-initialized
+
+# =================================================================
+# Project-Specific (zhzAI) - Final Additions
+# =================================================================
+
+# Ignore the new services directory which contains all sidecar binaries and DLLs
+/frontend/instant_assistant/src-tauri/services/
+
+# Explicitly ignore any potential qdrant data directories within src-tauri
+/frontend/instant_assistant/src-tauri/storage/
+/frontend/instant_assistant/src-tauri/snapshots/

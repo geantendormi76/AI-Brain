@@ -50,18 +50,9 @@ async fn dispatch_handler(
 
     // 使用 spawn_blocking 将业务逻辑移到另一个线程执行
     // 这保证了我们的 handler 本身返回的 Future 是 Send
-    let core_response = task::spawn_blocking(move || {
-        // 创建一个新的、小型的同步运行时来驱动我们的异步业务逻辑
-        // 这是在同步上下文中运行异步代码的标准模式
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .unwrap();
-        
-        rt.block_on(orchestrator.dispatch(&command))
-    })
-    .await? // .await 在这里等待 spawn_blocking 的任务完成，并处理 JoinError
-    .map_err(ApiError::Dispatch)?; // 将 dispatch 内部的 anyhow::Error 转换为 ApiError
+    let core_response = orchestrator.dispatch(&command)
+        .await
+        .map_err(ApiError::Dispatch)?;
 
     let api_response = match core_response {
         CoreResponse::Text(text) => ApiResponse { text },

@@ -16,17 +16,6 @@ use qdrant_client::{Payload, Qdrant};
 use serde_json::json;
 use std::any::Any;
 
-// 移除所有与LLM相关的 struct 定义（EmbeddingRequest除外）
-#[derive(serde::Serialize)]
-struct EmbeddingRequest<'a> {
-    content: &'a str,
-}
-#[derive(Debug, serde::Deserialize)]
-struct EmbeddingData {
-    embedding: Vec<Vec<f32>>,
-}
-#[derive(Debug, serde::Deserialize)]
-struct EmbeddingResponse(Vec<EmbeddingData>);
 
 type DbPool = Pool<SqliteConnectionManager>;
 const COLLECTION_NAME: &str = "memos";
@@ -279,46 +268,69 @@ impl MemosAgent {
         }
     }
 
-    // --- 保持不变的辅助函数 ---
+
+
     async fn get_embedding(&self, text: &str) -> Result<Vec<f32>, anyhow::Error> {
         println!("[MemosAgent-Embed] Requesting vector for text: '{}'", text);
         let client = reqwest::Client::new();
-        let response = client.post(&self.embedding_url).json(&EmbeddingRequest { content: text }).send().await?;
-        if !response.status().is_success() {
-            let error_body = response.text().await?;
-            return Err(anyhow::anyhow!("Embedding service returned an error: {}", error_body));
-        }
-        let mut embedding_response = response.json::<EmbeddingResponse>().await?;
-        if let Some(mut first_item) = embedding_response.0.pop() {
-            if let Some(embedding_vector) = first_item.embedding.pop() {
-                println!("[MemosAgent-Embed] Received {}d vector.", embedding_vector.len());
-                Ok(embedding_vector)
-            } else {
-                Err(anyhow::anyhow!("Embedding service returned an item with an empty embedding list."))
-            }
-        } else {
-            Err(anyhow::anyhow!("Embedding service returned an empty array."))
-        }
-    }
 
+        let request_url = format!("{}/embedding", self.embedding_url);
+        println!("[MemosAgent-Embed] Sending request to: {}", request_url);
+
+        let request_body = json!({ "content": text });
+
+        let response = client.post(&request_url)
+                            .json(&request_body)
+                            .send()
+                            .await?;
+
+        let status = response.status();
+        if !status.is_success() {
+            let error_body = response.text().await?;
+            return Err(anyhow::anyhow!("Embedding service returned an error (status {}): {}", status, error_body));
+        }
+
+        // 关键修正：定义一个与 llama.cpp 输出完全匹配的简单结构体
+        #[derive(serde::Deserialize)]
+        struct EmbeddingResponse {
+            embedding: Vec<f32>,
+        }
+
+        // 直接用这个正确的结构体来解析JSON，这是最稳健、最不容易出错的方式
+        let embedding_response = response.json::<EmbeddingResponse>().await?;
+        let embedding_vector = embedding_response.embedding;
+
+        if embedding_vector.is_empty() {
+            return Err(anyhow::anyhow!("Embedding service returned an empty embedding vector."));
+        }
+
+        println!("[MemosAgent-Embed] Received {}d vector.", embedding_vector.len());
+        Ok(embedding_vector)
+    }
+        
+        
+    // ==========================================================
+    // ====== 请将 extract_keywords 函数粘贴在这里 ======
+    // ==========================================================
     fn extract_keywords(&self, query_text: &str) -> Vec<String> {
         println!("[MemosAgent-Keyword] Extracting keywords with Jieba...");
         use jieba_rs::Jieba;
         use stop_words::{get, LANGUAGE};
 
         let jieba = Jieba::new();
+        // 假设我们的主要用户是中文用户
         let stop_words = get(LANGUAGE::Chinese);
 
         let keywords: Vec<String> = jieba.cut_for_search(query_text, true)
             .into_iter()
             .map(|s| s.to_lowercase())
-            .filter(|word| !stop_words.contains(word))
+            .filter(|word| !stop_words.contains(word) && !word.trim().is_empty()) // 增加非空判断
             .collect();
         
         println!("[MemosAgent-Keyword] Extracted keywords: {:?}", keywords);
         keywords
     }
-    
+
 
     fn apply_dynamic_threshold(&self, points: Vec<ScoredPoint>) -> Vec<ScoredPoint> {
         if points.is_empty() {

@@ -376,15 +376,18 @@ impl Orchestrator {
                 // --- 升级后的确定性规则路由 ---
                 let correction_keywords = ["不对", "错了", "不是", "应该是"];
                 if correction_keywords.iter().any(|&kw| text.contains(kw)) {
-                    let mut context_guard = self.last_interaction_context.lock().unwrap();
-                    if let Some(context) = context_guard.take() {
+                    let context_to_process = {
+                        self.last_interaction_context.lock().unwrap().take()
+                    };
+
+                    if let Some(context) = context_to_process {
                         if let ContextualAction::Save { memory_id } = context.last_action {
                             println!("[Orchestrator-DST] Contextual Route: Detected correction for last saved memory ID: {}", memory_id);
                             let final_response = self.handle_contextual_modify(memory_id, text).await?;
                             let mut history = self.conversation_history.lock().unwrap();
                             history.push(format!("User: {}", text));
                             history.push(format!("Assistant: {}", final_response));
-                            *self.last_full_interaction.lock().unwrap() = Some((text.to_string(), final_response.clone())); // 更新缓存
+                            *self.last_full_interaction.lock().unwrap() = Some((text.to_string(), final_response.clone()));
                             return Ok(Response::Text(final_response));
                         }
                     }
@@ -396,7 +399,7 @@ impl Orchestrator {
                     let mut history = self.conversation_history.lock().unwrap();
                     history.push(format!("User: {}", text));
                     history.push(format!("Assistant: {}", final_response));
-                    *self.last_full_interaction.lock().unwrap() = Some((text.to_string(), final_response.clone())); // 更新缓存
+                    *self.last_full_interaction.lock().unwrap() = Some((text.to_string(), final_response.clone()));
                     return Ok(Response::Text(final_response));
                 }
 
@@ -408,7 +411,7 @@ impl Orchestrator {
                     let mut history = self.conversation_history.lock().unwrap();
                     history.push(format!("User: {}", text));
                     history.push(format!("Assistant: {}", final_response));
-                    *self.last_full_interaction.lock().unwrap() = Some((text.to_string(), final_response.clone())); // 更新缓存
+                    *self.last_full_interaction.lock().unwrap() = Some((text.to_string(), final_response.clone()));
                     return Ok(Response::Text(final_response));
                 }
 
@@ -420,7 +423,7 @@ impl Orchestrator {
                     let mut history = self.conversation_history.lock().unwrap();
                     history.push(format!("User: {}", text));
                     history.push(format!("Assistant: {}", final_response));
-                    *self.last_full_interaction.lock().unwrap() = Some((text.to_string(), final_response.clone())); // 更新缓存
+                    *self.last_full_interaction.lock().unwrap() = Some((text.to_string(), final_response.clone()));
                     return Ok(Response::Text(final_response));
                 }
                 
@@ -432,10 +435,13 @@ impl Orchestrator {
                 #[derive(Deserialize)] struct ChatCompletionResponse { choices: Vec<ChatChoice> }
 
                 // --- LLM 降级路由 ---
-                let history_guard = self.conversation_history.lock().unwrap();
+                let history_clone = {
+                    self.conversation_history.lock().unwrap().clone()
+                };
+                
                 println!("[Orchestrator] Step 2: Routing with raw user text: '{}'", text);
                 
-                let router_messages = router::get_routing_prompt(text, &history_guard);
+                let router_messages = router::get_routing_prompt(text, &history_clone);
                 let chat_url = format!("{}/v1/chat/completions", self.llm_config.llm_url);
                 let router_request_body = json!({ "messages": router_messages, "temperature": 0.0 });
                 let router_response = self.llm_config.client.post(&chat_url).json(&router_request_body).send().await?;
@@ -459,16 +465,16 @@ impl Orchestrator {
                 println!("[Router] Cleaned Decision JSON: {}", router_content_str);
                 let decision: RoutingDecision = serde_json::from_str(router_content_str)?;
                 
-                drop(history_guard);
-
-                let mut pending_action_guard = self.pending_action.lock().unwrap();
-                if decision.tool_to_call != ToolToCall::ConfirmationTool {
-                    if pending_action_guard.is_some() {
-                        println!("[Orchestrator] New command received, cancelling previous pending action.");
-                        *pending_action_guard = None;
+                // 【最终修复】在这里添加作用域，确保 pending_action 的锁被及时释放
+                {
+                    let mut pending_action_guard = self.pending_action.lock().unwrap();
+                    if decision.tool_to_call != ToolToCall::ConfirmationTool {
+                        if pending_action_guard.is_some() {
+                            println!("[Orchestrator] New command received, cancelling previous pending action.");
+                            *pending_action_guard = None;
+                        }
                     }
-                }
-                drop(pending_action_guard);
+                } // <-- pending_action_guard 在这里被销毁，锁被释放
 
                 // --- 专家执行 ---
                 println!("[Orchestrator] Step 3: Executing expert with raw text.");
