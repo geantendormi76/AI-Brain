@@ -1,53 +1,63 @@
-// orchestrator/src/experts/modify_expert.rs
+// backend/orchestrator/src/experts/memos_agent/modify_expert.rs
+// 【V7.0 - 高内聚重构版】
 
+use reqwest::Client;
 use serde::Deserialize;
-use serde_json::Value;
+use serde_json::json;
 
-// 定义 ModifyExpert 生成修改后文本的输出结构
 #[derive(Deserialize, Debug)]
 pub struct ModifiedText {
     pub modified_text: String,
 }
 
-// 获取生成修改后文本的 Prompt
-pub fn get_text_modification_prompt(original_text: &str, user_request: &str) -> Vec<Value> {
+// 【新增】将LLM调用逻辑完全封装在此
+pub async fn run(
+    client: &Client,
+    llm_url: &str,
+    original_text: &str,
+    user_request: &str,
+) -> Result<String, anyhow::Error> {
     let system_prompt = format!(
-r#"You are a precise text editor. Your task is to take an original text and a user's modification request, then output the fully rewritten, new version of the text.
+        r#"You are a precise text editor. Your task is to take an original text and a user's modification request, then output the fully rewritten, new version of the text.
+Your output MUST be a valid JSON object with a single field "modified_text".
 
-**CRITICAL INSTRUCTIONS:**
-- You must output the entire new text, not just the changed part.
-- The new text must incorporate the user's requested change.
-- Your output MUST be a valid JSON object with a single field "modified_text".
-
-**Original Text:**
+Original Text:
 ---
 {}
 ---
 
-**User's Modification Request:**
+User's Modification Request:
 ---
 {}
 ---
 
-Now, generate the new, complete text based on the user's request."#, original_text, user_request);
+Now, generate the new, complete text based on the user's request."#,
+        original_text, user_request
+    );
 
-    vec![
-        serde_json::json!({"role": "system", "content": system_prompt}),
-        // 注意：这里没有 user role，因为所有信息都在 system prompt 里了
-    ]
-}
+    let gbnf_schema = r#"root ::= "{" ws "\"modified_text\"" ws ":" ws string ws "}"
+string ::= "\"" ( [^"\\] | "\\" (["\\/bfnrt] | "u" [0-9a-fA-F]{4}) )* "\""
+ws     ::= ([ \t\n\r])*"#;
 
+    let messages = vec![json!({ "role": "system", "content": system_prompt })];
+    let request_body = json!({ "messages": messages, "temperature": 0.0, "grammar": gbnf_schema });
+    let chat_url = format!("{}/v1/chat/completions", llm_url);
+    
+    #[derive(Deserialize)] struct ChatChoice { message: ChatMessageContent }
+    #[derive(Deserialize)] struct ChatMessageContent { content: String }
+    #[derive(Deserialize)] struct ChatCompletionResponse { choices: Vec<ChatChoice> }
 
+    let response = client.post(&chat_url).json(&request_body).send().await?;
+    let response_text = response.text().await?;
 
-// 【最终正确版】使用正确的、通用的 GBNF 语法定义 JSON 结构
-pub fn get_text_modification_gbnf_schema() -> &'static str {
-    r#"
-root   ::= "{" ws "\"modified_text\"" ws ":" ws string ws "}"
-# 采用官方示例中的 string 定义，允许所有合法的 JSON 字符串字符
-string ::= "\"" (
-  [^"\\\\] |
-  "\\" (["\\/bfnrt] | "u" [0-9a-fA-F]{4})
-)* "\""
-ws     ::= ([ \t\n\r])*
-"#
+    let chat_response: ChatCompletionResponse = serde_json::from_str(&response_text)
+         .map_err(|e| anyhow::anyhow!("Failed to parse modify_expert LLM choices: {}. Raw text: {}", e, response_text))?;
+    
+    let content_str = chat_response.choices.get(0).map(|c| c.message.content.trim())
+        .ok_or_else(|| anyhow::anyhow!("ModifyExpert LLM response is empty"))?;
+    
+    let modified_text_obj: ModifiedText = serde_json::from_str(content_str)
+        .map_err(|e| anyhow::anyhow!("Failed to parse ModifiedText from LLM content: {}. Raw content: {}", e, content_str))?;
+
+    Ok(modified_text_obj.modified_text)
 }
