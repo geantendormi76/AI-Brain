@@ -1,23 +1,26 @@
+# agent_memos/Cargo.toml
 [package]
 name = "agent_memos"
 version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-memos_core = { workspace = true }
-anyhow = { workspace = true }
-async-trait = { workspace = true }
-rusqlite = { workspace = true }
-r2d2 = { workspace = true }
-r2d2_sqlite = { workspace = true }
-chrono = { workspace = true }
-dirs = { workspace = true }
-qdrant-client = { workspace = true }
-serde_json = { workspace = true }
-tokio = { workspace = true }
-reqwest = { workspace = true } # <-- 自动继承工作区的统一配置
-serde = { workspace = true }
-stop-words = { workspace = true }
-jieba-rs = { workspace = true }
-futures-util = { workspace = true }
-bytes = { workspace = true }
+memos_core = { path = "../memos_core" }
+anyhow = "1.0"
+async-trait = "0.1"
+rusqlite = { version = "0.31.0", features = ["bundled"] }
+r2d2 = "0.8.10"
+r2d2_sqlite = "0.24.0"
+chrono = "0.4.38"
+dirs = "5.0"
+
+qdrant-client = "1.14.0"
+
+serde_json = "1.0"
+tokio = { version = "1", features = ["full"] }
+reqwest = { version = "0.12", features = ["json", "stream"] } # 确保这里有 "stream"
+serde = { version = "1.0", features = ["derive"] }
+stop-words = "0.8"
+jieba-rs = "0.6"
+futures-util = { version = "0.3", features = ["io"] } # 新增
+bytes = "1" # 新增

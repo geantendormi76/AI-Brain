@@ -11,25 +11,20 @@ members = [
 ]
 
 # ======================= 【补全缺失的部分】 =======================
-# 策略2：[workspace.dependencies] 为工作区成员提供统一的、便捷的依赖声明。
+# 为工作区所有成员提供一个统一的、可继承的依赖项列表
 [workspace.dependencies]
 anyhow = "1.0"
 async-trait = "0.1"
 axum = { version = "0.7.5", features = ["macros"] }
 bytes = "1"
 chrono = "0.4.38"
-common_utils = { path = "common_utils" }
 dirs = "5.0"
 futures-util = { version = "0.3", features = ["io"] }
 jieba-rs = "0.6"
-memos_core = { path = "memos_core" }
-agent_memos = { path = "agent_memos" }
-orchestrator = { path = "orchestrator" }
 qdrant-client = "1.14.0"
 r2d2 = "0.8.10"
 r2d2_sqlite = "0.24.0"
 regex = "1.10.4"
-# 统一定义 reqwest
 reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "native-tls-vendored"] }
 rusqlite = { version = "0.31.0", features = ["bundled"] }
 rustyline = "14.0"
@@ -41,3 +36,9 @@ thiserror = "1.0"
 tokio = { version = "1", features = ["full"] }
 tower-http = { version = "0.5.2", features = ["cors", "trace"] }
 tracing-subscriber = "0.3"
+
+# 关键：在这里定义工作区内部成员的依赖，以便其他成员通过 workspace = true 继承
+common_utils = { path = "common_utils" }
+memos_core = { path = "memos_core" }
+agent_memos = { path = "agent_memos" }
+orchestrator = { path = "orchestrator" }

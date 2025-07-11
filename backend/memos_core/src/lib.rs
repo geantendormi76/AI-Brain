@@ -3,7 +3,6 @@ use std::path::PathBuf;
 use async_trait::async_trait;
 use tokio::sync::mpsc; // 新增：用于Stream变体
 use std::any::Any;
-use serde::{Deserialize, Serialize};
 
 // 1. 标准化的指令：UI层发给调度器的唯一入口
 #[derive(Debug, Clone)] // Command 仍然可以 Clone
@@ -32,10 +31,4 @@ pub trait Agent: Send + Sync {
     
     // 新增: 用于支持向下转型 (downcasting)
     fn as_any(&self) -> &dyn Any;
-}
-
-
-#[derive(Serialize, Deserialize, Debug, Clone)]
-pub struct FactMetadata {
-    pub topics: Vec<String>,
 }

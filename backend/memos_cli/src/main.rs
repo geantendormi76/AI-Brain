@@ -41,11 +41,8 @@ async fn main() -> Result<(), anyhow::Error> {
     let qdrant_url = "http://localhost:6334";
     let llm_url = "http://localhost:8282";
 
-    // 【核心修改】为 MemosAgent::new 提供第二个参数
-    let embedding_url = "http://localhost:8181"; // 为 CLI 提供一个默认的 embedding url
-    let memos_agent = MemosAgent::new(qdrant_url, embedding_url).await?; 
-
-let agents: Vec<Box<dyn Agent>> = vec![Box::new(memos_agent)];
+    let memos_agent = MemosAgent::new(qdrant_url).await?;
+    let agents: Vec<Box<dyn Agent>> = vec![Box::new(memos_agent)];
     println!("Agents loaded: {} agent(s)", agents.len());
 
     let orchestrator = Orchestrator::new(agents, llm_url, reranker_llm_url);

@@ -1,13 +1,9 @@
 [package]
-name = "memos_core"
+name = "memos_core" # <--- 在这里修改
 version = "0.1.0"
-edition = "2021"
+edition = "2021"   # <--- 统一为 2021
 
 [dependencies]
-# 我们从工作区的[workspace.dependencies]中继承这些依赖
-anyhow = { workspace = true }
-async-trait = { workspace = true }
-tokio = { workspace = true, features = ["sync"] } # 保持特性声明
-
-# 【核心修正】: 为 memos_core 包添加对 serde 的依赖
-serde = { workspace = true, features = ["derive"] }
+anyhow = "1.0"
+async-trait = "0.1"
+tokio = { version = "1", features = ["sync"] } # 新增此行，只启用sync特性足够
