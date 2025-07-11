@@ -10,12 +10,6 @@ members = [
     "common_utils",
 ]
 
-# 策略1：[patch] 强制覆盖整个依赖树，解决底层冲突。
-[patch.crates-io]
-reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "native-tls-vendored"] }
-tonic = { version = "0.11", default-features = false, features = ["transport", "codegen", "prost", "tls"] }
-hyper-tls = { version = "0.6.0" }
-
 # ======================= 【补全缺失的部分】 =======================
 # 策略2：[workspace.dependencies] 为工作区成员提供统一的、便捷的依赖声明。
 [workspace.dependencies]

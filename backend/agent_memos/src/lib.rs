@@ -1,20 +1,29 @@
-// geantendormi76-ai-brain/backend/agent_memos/src/lib.rs
+// backend/agent_memos/src/lib.rs
+// 【头部最终修正版】
 
-// ... (文件顶部的所有 use 和 struct 定义保持不变)
-mod db; 
+mod db;
 mod query_expander;
-use query_expander::QueryExpander;
-use memos_core::{Agent, Command, Response};
+
 use async_trait::async_trait;
-use r2d2_sqlite::SqliteConnectionManager;
-use r2d2::Pool;
 use chrono::Utc;
-use std::collections::HashMap;
-use qdrant_client::qdrant::{PointStruct, Vector, VectorParamsBuilder, CreateCollectionBuilder, Distance, UpsertPointsBuilder, SearchPointsBuilder, ScoredPoint, point_id, vector::Vector as QdrantVectorEnums, DenseVector, PointsIdsList, DeletePointsBuilder};
-use qdrant_client::{Payload, Qdrant};
+use qdrant_client::{
+    qdrant::{
+        point_id, r#match::MatchValue, vector::Vector as QdrantVectorEnums, Condition,
+        CreateCollectionBuilder, DeletePointsBuilder, DenseVector, Distance, Filter,
+        PointStruct, PointsIdsList, RetrievedPoint, ScoredPoint, ScrollPointsBuilder,
+        SearchPointsBuilder, UpsertPointsBuilder, Vector, VectorParamsBuilder,
+    },
+    Payload, Qdrant,
+};
+use r2d2::Pool;
+use r2d2_sqlite::SqliteConnectionManager;
 use serde_json::json;
 use std::any::Any;
-use serde::Deserialize;
+use std::collections::HashMap;
+
+use crate::query_expander::QueryExpander;
+use memos_core::{Agent, Command, FactMetadata, Response};
+
 
 type DbPool = Pool<SqliteConnectionManager>;
 const COLLECTION_NAME: &str = "memos";
@@ -27,41 +36,9 @@ pub struct MemosAgent {
     embedding_url: String,
 }
 
-#[derive(Debug, Deserialize)]
-#[serde(untagged)]
-enum EmbeddingResponse {
-    OpenAI(OpenAIEmbeddingResponse),
-    Simple(SimpleEmbeddingResponse),
-}
-
-#[derive(Debug, Deserialize)]
-struct SimpleEmbeddingResponse {
-    embedding: Vec<f32>,
-}
-
-#[derive(Debug, Deserialize)]
-struct OpenAIEmbeddingResponse {
-    data: Vec<EmbeddingData>,
-}
-
-#[derive(Debug, Deserialize)]
-struct EmbeddingData {
-    embedding: Vec<f32>,
-}
-
-impl EmbeddingResponse {
-    fn extract_vector(self) -> Result<Vec<f32>, anyhow::Error> {
-        match self {
-            EmbeddingResponse::OpenAI(resp) => {
-                resp.data
-                    .into_iter()
-                    .next()
-                    .map(|d| d.embedding)
-                    .ok_or_else(|| anyhow::anyhow!("OpenAI response format did not contain any embedding data in 'data' array."))
-            }
-            EmbeddingResponse::Simple(resp) => Ok(resp.embedding),
-        }
-    }
+#[derive(serde::Deserialize, Debug)]
+struct LlamaCppEmbeddingItem {
+    embedding: Vec<Vec<f32>>, 
 }
 
 
@@ -141,24 +118,55 @@ impl MemosAgent {
     }
 
 
-    pub async fn save(&self, content: &str) -> Result<i64, anyhow::Error> {
-        println!("[MemosAgent] Saving memo: '{}'", content);
+    pub async fn save(&self, content: &str, metadata: Option<FactMetadata>) -> Result<i64, anyhow::Error> {
+        println!("[MemosAgent] Saving memo with metadata: '{}'", content);
         let conn = self.sql_pool.get()?;
         let now = Utc::now().to_rfc3339();
-        conn.execute("INSERT INTO facts (content, created_at) VALUES (?1, ?2)", &[content, &now])?;
+
+        // 1. 【升级】处理元数据，将其序列化为JSON字符串以便存入SQLite
+        let metadata_json_string = metadata.as_ref()
+            .map(|m| serde_json::to_string(m).unwrap_or_else(|_| "{}".to_string()))
+            .unwrap_or_else(|| "{}".to_string());
+
+        // 2. 【升级】执行带元数据的SQL插入
+        conn.execute(
+            "INSERT INTO facts (content, metadata, created_at) VALUES (?1, ?2, ?3)",
+            &[content, &metadata_json_string, &now],
+        )?;
         let memo_id = conn.last_insert_rowid();
         println!("[MemosAgent-DB] Saved to SQLite with ID: {}", memo_id);
+
+        // 3. 【升级】构建同时包含 content 和 metadata 的 Qdrant Payload
         let vector_data = self.get_embedding(content).await?;
         let qdrant_vector = Vector {
             vector: Some(QdrantVectorEnums::Dense(DenseVector { data: vector_data })),
             ..Default::default()
         };
-        let payload: Payload = json!({"content": content,"created_at": now}).try_into().unwrap();
+
+        // 在Payload中加入topics，以便后续进行过滤搜索
+        let payload_map = if let Some(meta) = metadata {
+            json!({
+                "content": content,
+                "created_at": now,
+                "metadata": {
+                    "topics": meta.topics
+                }
+            })
+        } else {
+            json!({
+                "content": content,
+                "created_at": now
+            })
+        };
+        
+        let payload: Payload = payload_map.try_into()?;
         let points = vec![PointStruct::new(memo_id as u64, qdrant_vector, payload)];
         self.qdrant_client.upsert_points(UpsertPointsBuilder::new(COLLECTION_NAME.to_string(), points)).await?;
-        println!("[MemosAgent-DB] Upserted point to Qdrant with ID: {}", memo_id);
+        
+        println!("[MemosAgent-DB] Upserted point to Qdrant with ID: {} and metadata.", memo_id);
         Ok(memo_id)
     }
+
 
     pub async fn recall(&self, query_text: &str) -> Result<Vec<ScoredPoint>, anyhow::Error> {
         println!("[MemosAgent] Recalling V2.2 for: '{}'", query_text);
@@ -169,46 +177,66 @@ impl MemosAgent {
 
         const VECTOR_SCORE_THRESHOLD: f32 = 0.5;
 
+        // 【核心修正】: 明确地将所有块内的错误都转换为 anyhow::Error
         let (vec_original_res, vec_expanded_res, keyword_scroll_res) = tokio::try_join!(
             async {
-                let vector = self.get_embedding(&original_query).await?;
-                self.qdrant_client.search_points(
-                    SearchPointsBuilder::new(COLLECTION_NAME, vector, 5)
-                        .with_payload(true)
-                        .score_threshold(VECTOR_SCORE_THRESHOLD)
-                ).await.map_err(|e| anyhow::anyhow!("Original vector search failed: {}", e))
+                let vector = self.get_embedding(&original_query).await?; // 返回 anyhow::Error
+                self.qdrant_client
+                    .search_points(
+                        SearchPointsBuilder::new(COLLECTION_NAME, vector, 5)
+                            .with_payload(true)
+                            .score_threshold(VECTOR_SCORE_THRESHOLD),
+                    )
+                    .await
+                    .map_err(anyhow::Error::from) // 将 QdrantError 转换为 anyhow::Error
             },
             async {
-                let vector = self.get_embedding(&expanded_query_str).await?;
-                self.qdrant_client.search_points(
-                    SearchPointsBuilder::new(COLLECTION_NAME, vector, 5)
-                        .with_payload(true)
-                        .score_threshold(VECTOR_SCORE_THRESHOLD)
-                ).await.map_err(|e| anyhow::anyhow!("Expanded vector search failed: {}", e))
+                let vector = self.get_embedding(&expanded_query_str).await?; // 返回 anyhow::Error
+                self.qdrant_client
+                    .search_points(
+                        SearchPointsBuilder::new(COLLECTION_NAME, vector, 5)
+                            .with_payload(true)
+                            .score_threshold(VECTOR_SCORE_THRESHOLD),
+                    )
+                    .await
+                    .map_err(anyhow::Error::from) // 将 QdrantError 转换为 anyhow::Error
             },
             async {
                 let keywords = self.extract_keywords(query_text);
                 if keywords.is_empty() {
                     return Ok(None);
                 }
-                use qdrant_client::qdrant::{r#match::MatchValue, Condition, Filter};
-                let filter = Filter::must(keywords.iter().map(|k| Condition::matches("content", MatchValue::Text(k.clone()))));
-                let scroll_response = self.qdrant_client.scroll(
-                    qdrant_client::qdrant::ScrollPointsBuilder::new(COLLECTION_NAME).filter(filter).limit(5).with_payload(true)
-                ).await.map_err(|e| anyhow::anyhow!("Keyword search failed: {}", e))?;
+                let filter = Filter::must(
+                    keywords
+                        .iter()
+                        .map(|k| Condition::matches("content", MatchValue::Text(k.clone()))),
+                );
+                let scroll_response = self.qdrant_client
+                    .scroll(
+                        ScrollPointsBuilder::new(COLLECTION_NAME)
+                            .filter(filter)
+                            .limit(5)
+                            .with_payload(true),
+                    )
+                    .await
+                    .map_err(anyhow::Error::from)?; // 将 QdrantError 转换为 anyhow::Error
                 Ok(Some(scroll_response))
             }
         )?;
 
         let mut all_results: Vec<Vec<ScoredPoint>> = Vec::new();
+        
+        // 【核心修正】: try_join! 成功后，返回的值不再是 Result，直接使用 .result
         all_results.push(vec_original_res.result);
         all_results.push(vec_expanded_res.result);
+        
+        // 【核心修正】: 对 Option<T> 类型的 keyword_scroll_res 进行正确处理
         if let Some(scroll_res) = keyword_scroll_res {
-            let keyword_points = scroll_res.result.into_iter().map(|p: qdrant_client::qdrant::RetrievedPoint| {
+            let keyword_points = scroll_res.result.into_iter().map(|p: RetrievedPoint| {
                 ScoredPoint {
                     id: p.id,
                     payload: p.payload,
-                    score: 1.0, 
+                    score: 1.0,
                     version: 0,
                     vectors: p.vectors,
                     order_value: p.order_value,
@@ -224,6 +252,7 @@ impl MemosAgent {
         Ok(filtered_points)
     }
 
+    
     pub async fn update(&self, id: i64, new_content: &str) -> Result<(), anyhow::Error> {
         println!("[MemosAgent] Updating memo ID: {}", id);
         use rusqlite::params; 
@@ -282,71 +311,52 @@ impl MemosAgent {
         }
     }
 
-    // ======================= 【最终诊断版函数 v2】 =======================
     async fn get_embedding(&self, text: &str) -> Result<Vec<f32>, anyhow::Error> {
         println!("[MemosAgent-Embed] Requesting vector for text: '{}'", text);
         let client = reqwest::Client::new();
         let request_url = format!("{}/embedding", self.embedding_url);
-        let request_body = json!({ "input": text });
+        
+        // 关键修正：确保发送的JSON字段是 "content"
+        let request_body = serde_json::json!({ "content": text });
 
-        // 步骤 1: 发送请求，并用 match 显式处理结果，不再使用 `?`
-        let response_result = client.post(&request_url)
+        let response = client.post(&request_url)
             .json(&request_body)
             .send()
-            .await;
+            .await?;
 
-        let response = match response_result {
-            Ok(resp) => resp,
-            Err(e) => {
-                // 如果请求发送失败，打印详细错误并立即返回
-                eprintln!("\n\n[ULTIMATE_DIAGNOSIS] Request sending failed: {:#?}\n\n", e);
-                return Err(e.into());
-            }
-        };
-
-        // 步骤 2: 检查响应状态
         let status = response.status();
         if !status.is_success() {
             let error_body = response.text().await.unwrap_or_else(|e| format!("Could not read error body: {}", e));
-            eprintln!("\n\n[ULTIMATE_DIAGNOSIS] Service returned non-success status: {} - {}\n\n", status, error_body);
             return Err(anyhow::anyhow!("Embedding service returned an error (status {}): {}", status, error_body));
         }
 
-        // 步骤 3: 读取响应体为字节流（最原始、最不可能panic的方式）
-        let bytes_result = response.bytes().await;
-        let raw_bytes = match bytes_result {
-            Ok(b) => b,
-            Err(e) => {
-                eprintln!("\n\n[ULTIMATE_DIAGNOSIS] Failed to read response bytes: {:#?}\n\n", e);
-                return Err(e.into());
-            }
-        };
+        let raw_text = response.text().await?;
+        // println!("[MemosAgent-Embed] Raw response text: {}", raw_text);
 
-        // 步骤 4: 将字节流转换为文本，并打印
-        let raw_text = String::from_utf8_lossy(&raw_bytes);
-        println!("[MemosAgent-Embed] Raw response text: {}", raw_text);
-
-        // 步骤 5: 解析文本为JSON
-        let embedding_response: EmbeddingResponse = match serde_json::from_str(&raw_text) {
+        // 使用新的结构体进行解析
+        // 我们期望得到一个包含单个元素的数组： Vec<LlamaCppEmbeddingItem>
+        let mut parsed_response: Vec<LlamaCppEmbeddingItem> = match serde_json::from_str(&raw_text) {
             Ok(resp) => resp,
             Err(e) => {
-                eprintln!("\n\n[ULTIMATE_DIAGNOSIS] Failed to parse JSON: {:#?}. Raw text was: '{}'\n\n", e, raw_text);
+                eprintln!("\n\n[ULTIMATE_DIAGNOSIS] Failed to parse JSON with new struct: {:#?}. Raw text was: '{}'\n\n", e, raw_text);
                 return Err(e.into());
             }
         };
         
-        // 步骤 6: 从解析后的结构中提取向量
-        let embedding_vector = embedding_response.extract_vector()?;
-
-        if embedding_vector.is_empty() {
-            return Err(anyhow::anyhow!("Embedding service returned an empty embedding vector."));
+        // 从解析后的复杂结构中提取出我们需要的扁平向量 Vec<f32>
+        if let Some(first_item) = parsed_response.pop() {
+            if let Some(embedding_vector) = first_item.embedding.into_iter().next() {
+                if !embedding_vector.is_empty() {
+                    println!("[MemosAgent-Embed] Successfully extracted {}d vector.", embedding_vector.len());
+                    return Ok(embedding_vector);
+                }
+            }
         }
-
-        println!("[MemosAgent-Embed] Received and successfully parsed {}d vector.", embedding_vector.len());
-        Ok(embedding_vector)
-    }
-    // ======================= 【函数结束】 =======================
         
+        Err(anyhow::anyhow!("Failed to extract embedding vector from parsed response. The structure might be empty."))
+    } 
+
+    
     fn extract_keywords(&self, query_text: &str) -> Vec<String> {
         println!("[MemosAgent-Keyword] Extracting keywords with Jieba...");
         use jieba_rs::Jieba;
