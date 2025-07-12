@@ -50,7 +50,7 @@ rust-toolchain.toml
 .pub-cache/
 .pub/
 /build/
-
+ort_libs/
 # IDE-specific
 .idea/
 *.iml

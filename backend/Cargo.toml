@@ -7,7 +7,7 @@ members = [
     "agent_memos",
     "memos_core",
     "memos_cli", 
-    "common_utils",
+    "common_utils", "micromodels",
 ]
 
 # ======================= 【补全缺失的部分】 =======================
@@ -42,3 +42,4 @@ common_utils = { path = "common_utils" }
 memos_core = { path = "memos_core" }
 agent_memos = { path = "agent_memos" }
 orchestrator = { path = "orchestrator" }
+micromodels = { path = "micromodels" } 
