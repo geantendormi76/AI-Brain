@@ -2,12 +2,13 @@
 
 use anyhow::Result;
 use ort::session::{Session, builder::GraphOptimizationLevel};
-use ort::{inputs, execution_providers::CPUExecutionProvider, value::{Value, Tensor}};
+use ort::{inputs, value::{Value, Tensor}};
 use serde::Deserialize;
 use std::collections::HashMap;
 use std::fs::File;
 use std::path::Path;
 use ndarray::{Array1, Axis};
+use std::fs;
 
 // --- 结构体定义 (保持不变) ---
 #[derive(Debug, PartialEq, Eq, Clone)]
@@ -31,13 +32,23 @@ impl Classifier {
     pub fn load(model_path: impl AsRef<Path>, data_path: impl AsRef<Path>, labels: Vec<Intent>) -> Result<Self> {
         let _ = ort::init()
             .with_name("zhzAI-micromodels")
-            .with_execution_providers([CPUExecutionProvider::default().build()])
+            .with_execution_providers([ort::execution_providers::CPUExecutionProvider::default().build()])
             .commit();
 
-        let session = Session::builder()?
-            .with_optimization_level(GraphOptimizationLevel::Level3)?
-            .with_intra_threads(1)?
-            .commit_from_file(model_path)?;
+        // 1. 我们手动将模型文件读入内存
+        let model_bytes = fs::read(&model_path)
+            .map_err(|e| anyhow::anyhow!("Failed to read model file {:?}: {}", model_path.as_ref(), e))?;
+
+        // 2. 使用 commit_from_memory_buffer
+        let session = Session::builder()
+            .map_err(|e| anyhow::anyhow!("Failed to create session builder: {}", e))?
+            .with_optimization_level(GraphOptimizationLevel::Level3)
+            .map_err(|e| anyhow::anyhow!("Failed to set optimization level: {}", e))?
+            .with_intra_threads(1)
+            .map_err(|e| anyhow::anyhow!("Failed to set intra-threads: {}", e))?
+            // 3. 严格服从编译器指示，使用 commit_from_memory
+            .commit_from_memory(&model_bytes)
+            .map_err(|e| anyhow::anyhow!("Failed to commit model from memory: {}", e))?;
         
         let file = File::open(data_path)?;
         let preprocessor_data: PreprocessorData = serde_json::from_reader(file)?;

@@ -2,7 +2,8 @@
 
 mod experts;
 mod preprocessors;
-
+use micromodels::{Classifier, Intent as MicroIntent}; // 使用别名避免与未来可能的内部Intent冲突
+use std::path::Path;
 use agent_memos::MemosAgent;
 use memos_core::{Agent, Command, Response};
 use reqwest::Client;
@@ -12,10 +13,8 @@ use std::sync::{Arc, Mutex};
 
 // 【最终风格修正】使用 snake_case 路径
 use experts::memos_agent::{
-    router::{self, RoutingDecision, ToolToCall},
     save_expert,
-    modify_expert, // <-- 新增的导入项
-    confirmation_expert,
+    modify_expert,
     re_ranker::{ReRanker, ReRankRequest, DocumentToRank, ReRankStrategy},
 };
 use std::fs::OpenOptions;
@@ -71,27 +70,45 @@ pub struct Orchestrator {
     pending_action: Arc<Mutex<Option<PendingAction>>>,
     last_interaction_context: Arc<Mutex<Option<InteractionContext>>>,
     last_full_interaction: Arc<Mutex<Option<(String, String)>>>, 
+    is_question_classifier: Mutex<Classifier>,
+    confirmation_classifier: Mutex<Classifier>,
 }
 
 
 impl Orchestrator {
-    pub fn new(agents: Vec<Box<dyn Agent>>, llm_url: &str, reranker_llm_url: Option<&str>) -> Self {
-        println!("[Orchestrator] V5.3 Initializing with Agent-centric module structure.");
-        let reranker = if let Some(url) = reranker_llm_url {
-            println!("[Orchestrator] ReRanker is ENABLED.");
-            Some(ReRanker::new(url))
-        } else {
-            println!("[Orchestrator] ReRanker is DISABLED.");
-            None
-        };
+    pub fn new(agents: Vec<Box<dyn Agent>>, llm_url: &str, reranker_llm_url: Option<&str>, models_path: &Path) -> Self {
+        println!("[Orchestrator] Loading micromodels from path: {:?}", models_path);
+
+        // 加载问题分类器
+        let is_question_model_path = models_path.join("is_question_classifier.onnx");
+        let is_question_data_path = models_path.join("is_question_preprocessor_data.json");
+        let is_question_classifier = Classifier::load(
+            is_question_model_path,
+            is_question_data_path,
+            vec![MicroIntent::Question, MicroIntent::Statement, MicroIntent::Unknown] // 确保包含所有可能的标签
+        ).expect("CRITICAL: Failed to load is_question classifier.");
+        println!("[Orchestrator] 'is_question_classifier' loaded successfully.");
+
+        // 加载确认分类器
+        let confirmation_model_path = models_path.join("confirmation_classifier.onnx");
+        let confirmation_data_path = models_path.join("confirmation_preprocessor_data.json");
+        let confirmation_classifier = Classifier::load(
+            confirmation_model_path,
+            confirmation_data_path,
+            vec![MicroIntent::Affirm, MicroIntent::Deny, MicroIntent::Unknown] // 确保包含所有可能的标签
+        ).expect("CRITICAL: Failed to load confirmation classifier.");
+        println!("[Orchestrator] 'confirmation_classifier' loaded successfully.");
+
         Self {
             agents,
             llm_config: LLMConfig::new(llm_url),
             conversation_history: Arc::new(Mutex::new(Vec::new())),
-            reranker,
+            reranker: reranker_llm_url.map(ReRanker::new),
             pending_action: Arc::new(Mutex::new(None)),
             last_interaction_context: Arc::new(Mutex::new(None)),
             last_full_interaction: Arc::new(Mutex::new(None)),
+            is_question_classifier: Mutex::new(is_question_classifier),
+            confirmation_classifier: Mutex::new(confirmation_classifier),
         }
     }
 
@@ -229,17 +246,19 @@ impl Orchestrator {
     async fn handle_confirmation(&self, text: &str) -> Result<String, anyhow::Error> {
         let pending_action = self.pending_action.lock().unwrap().take();
         if let Some(action) = pending_action {
-            match confirmation_expert::parse_confirmation(text) {
-                confirmation_expert::ConfirmationDecision::Affirm => {
-                    println!("[ConfirmationExpert] User affirmed. Executing pending action.");
+            let intent = self.confirmation_classifier.lock().unwrap().predict(text);
+            
+            match intent {
+                MicroIntent::Affirm => {
+                    println!("[ConfirmationExpert] Micromodel classified as 'Affirm'. Executing pending action.");
                     self.execute_pending_action(action).await
                 }
-                confirmation_expert::ConfirmationDecision::Deny => {
-                    println!("[ConfirmationExpert] User denied. Cancelling pending action.");
+                MicroIntent::Deny => {
+                    println!("[ConfirmationExpert] Micromodel classified as 'Deny'. Cancelling pending action.");
                     Ok("好的，已取消操作。".to_string())
                 }
-                confirmation_expert::ConfirmationDecision::Unclear => {
-                    println!("[ConfirmationExpert] User response unclear. Re-instating pending action.");
+                _ => { // 处理 Unclear 和其他所有情况
+                    println!("[ConfirmationExpert] Micromodel response unclear. Re-instating pending action.");
                     *self.pending_action.lock().unwrap() = Some(action);
                     Ok("抱歉，我没太明白。请明确回复“是”或“否”。".to_string())
                 }
@@ -298,48 +317,6 @@ impl Orchestrator {
     }
 
 
-    async fn handle_contextual_modify(&self, memory_id: i64, correction_text: &str) -> Result<String, anyhow::Error> {
-        println!("[Orchestrator-DST] Handling contextual modification for memory ID: {}", memory_id);
-        
-        let memos_agent = self.agents.iter()
-            .find_map(|a| a.as_any().downcast_ref::<MemosAgent>())
-            .ok_or_else(|| anyhow::anyhow!("MemosAgent not found"))?;
-
-        // 1. 根据ID获取旧的记忆内容
-        let original_content = match memos_agent.get_by_id(memory_id).await? {
-            Some(content) => content,
-            None => return Ok(format!("抱歉，我找不到刚才那条ID为 {} 的记忆了，无法为您修正。", memory_id)),
-        };
-        
-        println!("[Orchestrator-DST] Found original content for ID {}: '{}'", memory_id, original_content);
-
-        // 2. 调用LLM，让它根据旧内容和用户的修正指令，生成新内容
-        #[derive(Deserialize)] struct ChatChoice { message: ChatMessageContent }
-        #[derive(Deserialize)] struct ChatMessageContent { content: String }
-        #[derive(Deserialize)] struct ChatCompletionResponse { choices: Vec<ChatChoice> }
-
-        let messages = modify_expert::get_text_modification_prompt(&original_content, correction_text);
-        let gbnf_schema = modify_expert::get_text_modification_gbnf_schema();
-        let request_body = json!({ "messages": messages, "temperature": 0.0, "grammar": gbnf_schema });
-        let chat_url = format!("{}/v1/chat/completions", self.llm_config.llm_url);
-        
-        let response = self.llm_config.client.post(&chat_url).json(&request_body).send().await?;
-        let chat_response: ChatCompletionResponse = response.json().await?;
-        let content_str = chat_response.choices.get(0).map(|c| c.message.content.trim())
-            .ok_or_else(|| anyhow::anyhow!("Contextual Modify LLM response is empty"))?;
-        
-        let modified_text_obj: modify_expert::ModifiedText = serde_json::from_str(content_str)?;
-        let new_content = &modified_text_obj.modified_text;
-
-        println!("[Orchestrator-DST] LLM generated new text: '{}'", new_content);
-
-        // 3. 使用ID和新内容更新数据库
-        memos_agent.update(memory_id, new_content).await?;
-
-        Ok(format!("好的，我已经将记忆更新为：{}", new_content))
-    }
-
-
     pub fn handle_feedback(&self) {
         if let Some((user_input, assistant_response)) = self.last_full_interaction.lock().unwrap().as_ref() {
             // 定义我们希望的训练数据格式
@@ -373,127 +350,64 @@ impl Orchestrator {
     pub async fn dispatch(&self, command: &Command) -> Result<Response, anyhow::Error> {
         match command {
             Command::ProcessText(text) => {
-                // --- 升级后的确定性规则路由 ---
-                let correction_keywords = ["不对", "错了", "不是", "应该是"];
-                if correction_keywords.iter().any(|&kw| text.contains(kw)) {
-                    let mut context_guard = self.last_interaction_context.lock().unwrap();
-                    if let Some(context) = context_guard.take() {
-                        if let ContextualAction::Save { memory_id } = context.last_action {
-                            println!("[Orchestrator-DST] Contextual Route: Detected correction for last saved memory ID: {}", memory_id);
-                            let final_response = self.handle_contextual_modify(memory_id, text).await?;
-                            let mut history = self.conversation_history.lock().unwrap();
-                            history.push(format!("User: {}", text));
-                            history.push(format!("Assistant: {}", final_response));
-                            *self.last_full_interaction.lock().unwrap() = Some((text.to_string(), final_response.clone())); // 更新缓存
-                            return Ok(Response::Text(final_response));
+                // --- V9.7 最终版：使用微模型进行第一层路由 ---
+                println!("[Orchestrator] Using 'is_question_classifier' for routing...");
+                
+                // 1. 正确地从 Mutex 获取可变借用并调用 predict
+                let intent = self.is_question_classifier.lock().unwrap().predict(text);
+
+                // 2. 根据微模型的分类结果，直接调用对应的专家函数
+                let final_response = match intent {
+                    MicroIntent::Question => {
+                        println!("[Orchestrator] Micromodel classified as 'Question'. Routing to RecallExpert.");
+                        // 在调用专家前，清理可能存在的pending_action
+                        *self.pending_action.lock().unwrap() = None;
+                        self.handle_recall(text).await?
+                    }
+                    MicroIntent::Statement => {
+                        // 对于陈述句，我们还需要进一步判断是保存、修改还是删除
+                        // 这里我们暂时简化，先实现最常见的“保存”
+                        // 并且在调用专家前，清理可能存在的pending_action
+                        println!("[Orchestrator] Micromodel classified as 'Statement'.");
+                        *self.pending_action.lock().unwrap() = None;
+                        
+                        // 简单的关键词判断来分流 Statement
+                        let modify_keywords = ["修改", "改成", "更新", "编辑"];
+                        let delete_keywords = ["删除", "忘掉", "去掉", "移除"];
+
+                        if modify_keywords.iter().any(|&kw| text.contains(kw)) {
+                            println!("[Orchestrator] Heuristic Route: Detected ModifyTool from Statement.");
+                            self.handle_modify(text).await?
+                        } else if delete_keywords.iter().any(|&kw| text.contains(kw)) {
+                            println!("[Orchestrator] Heuristic Route: Detected DeleteTool from Statement.");
+                            self.handle_delete(text).await?
+                        } else {
+                            println!("[Orchestrator] Defaulting Statement to SaveExpert.");
+                            self.handle_save(text).await?
                         }
                     }
-                }
-                
-                if confirmation_expert::parse_confirmation(text) != confirmation_expert::ConfirmationDecision::Unclear {
-                    println!("[Orchestrator] Heuristic Route: Detected ConfirmationTool.");
-                    let final_response = self.handle_confirmation(text).await?;
-                    let mut history = self.conversation_history.lock().unwrap();
-                    history.push(format!("User: {}", text));
-                    history.push(format!("Assistant: {}", final_response));
-                    *self.last_full_interaction.lock().unwrap() = Some((text.to_string(), final_response.clone())); // 更新缓存
-                    return Ok(Response::Text(final_response));
-                }
-
-                let modify_keywords = ["修改", "改成", "更新", "编辑"];
-                if modify_keywords.iter().any(|&kw| text.contains(kw)) {
-                    println!("[Orchestrator] Heuristic Route: Detected ModifyTool via keywords.");
-                    *self.last_interaction_context.lock().unwrap() = None;
-                    let final_response = self.handle_modify(text).await?;
-                    let mut history = self.conversation_history.lock().unwrap();
-                    history.push(format!("User: {}", text));
-                    history.push(format!("Assistant: {}", final_response));
-                    *self.last_full_interaction.lock().unwrap() = Some((text.to_string(), final_response.clone())); // 更新缓存
-                    return Ok(Response::Text(final_response));
-                }
-
-                let delete_keywords = ["删除", "忘掉", "去掉", "移除"];
-                if delete_keywords.iter().any(|&kw| text.contains(kw)) {
-                    println!("[Orchestrator] Heuristic Route: Detected DeleteTool via keywords.");
-                    *self.last_interaction_context.lock().unwrap() = None;
-                    let final_response = self.handle_delete(text).await?;
-                    let mut history = self.conversation_history.lock().unwrap();
-                    history.push(format!("User: {}", text));
-                    history.push(format!("Assistant: {}", final_response));
-                    *self.last_full_interaction.lock().unwrap() = Some((text.to_string(), final_response.clone())); // 更新缓存
-                    return Ok(Response::Text(final_response));
-                }
-                
-                println!("[Orchestrator] No heuristic matched. Downgrading to LLM Router.");
-                *self.last_interaction_context.lock().unwrap() = None;
-
-                #[derive(Deserialize)] struct ChatChoice { message: ChatMessageContent }
-                #[derive(Deserialize)] struct ChatMessageContent { content: String }
-                #[derive(Deserialize)] struct ChatCompletionResponse { choices: Vec<ChatChoice> }
-
-                // --- LLM 降级路由 ---
-                let history_guard = self.conversation_history.lock().unwrap();
-                println!("[Orchestrator] Step 2: Routing with raw user text: '{}'", text);
-                
-                let router_messages = router::get_routing_prompt(text, &history_guard);
-                let chat_url = format!("{}/v1/chat/completions", self.llm_config.llm_url);
-                let router_request_body = json!({ "messages": router_messages, "temperature": 0.0 });
-                let router_response = self.llm_config.client.post(&chat_url).json(&router_request_body).send().await?;
-                if !router_response.status().is_success() {
-                    return Err(anyhow::anyhow!("Router LLM call failed: {}", router_response.text().await?));
-                }
-                
-                let router_chat_response: ChatCompletionResponse = router_response.json().await?;
-                let raw_content_str = router_chat_response.choices.get(0).map(|c| c.message.content.trim())
-                    .ok_or_else(|| anyhow::anyhow!("Router LLM response is empty"))?;
-                
-                use regex::Regex;
-                println!("[Router] Raw LLM Output: {}", raw_content_str);
-                let re = Regex::new(r"\{[\s\S]*\}")?;
-                let router_content_str = if let Some(mat) = re.find(raw_content_str) {
-                    mat.as_str()
-                } else {
-                    return Err(anyhow::anyhow!("No valid JSON object found in LLM response. Raw output was: {}", raw_content_str));
-                };
-
-                println!("[Router] Cleaned Decision JSON: {}", router_content_str);
-                let decision: RoutingDecision = serde_json::from_str(router_content_str)?;
-                
-                drop(history_guard);
-
-                let mut pending_action_guard = self.pending_action.lock().unwrap();
-                if decision.tool_to_call != ToolToCall::ConfirmationTool {
-                    if pending_action_guard.is_some() {
-                        println!("[Orchestrator] New command received, cancelling previous pending action.");
-                        *pending_action_guard = None;
+                    MicroIntent::Affirm | MicroIntent::Deny => {
+                        // 如果主意图是确认/否定，直接路由到确认处理器
+                        println!("[Orchestrator] Micromodel classified as 'Affirm/Deny'. Routing to ConfirmationHandler.");
+                        self.handle_confirmation(text).await?
                     }
-                }
-                drop(pending_action_guard);
-
-                // --- 专家执行 ---
-                println!("[Orchestrator] Step 3: Executing expert with raw text.");
-                let final_response = match decision.tool_to_call {
-                    ToolToCall::SaveTool => self.handle_save(text).await?,
-                    ToolToCall::RecallTool => self.handle_recall(text).await?,
-                    ToolToCall::ModifyTool => self.handle_modify(text).await?,
-                    ToolToCall::DeleteTool => self.handle_delete(text).await?,
-                    ToolToCall::ConfirmationTool => self.handle_confirmation(text).await?,
-                    ToolToCall::NoTool => "抱歉，我不太明白您的意思，可以换个方式说吗？".to_string(),
+                    MicroIntent::Unknown => {
+                        println!("[Orchestrator] Micromodel classification is 'Unknown'. Using fallback response.");
+                        "抱歉，我不太明白您的意思，可以换个方式说吗？".to_string()
+                    }
                 };
 
-                // --- 更新历史记录并返回 ---
+                // --- 3. 统一处理历史记录和上下文缓存 ---
                 let mut history = self.conversation_history.lock().unwrap();
                 history.push(format!("User: {}", text));
                 history.push(format!("Assistant: {}", final_response));
                 const MAX_HISTORY_SIZE: usize = 8;
-                let current_len = history.len();
-                if current_len > MAX_HISTORY_SIZE {
-                    let drain_count = current_len - MAX_HISTORY_SIZE;
+                if history.len() > MAX_HISTORY_SIZE {
+                    let drain_count = history.len() - MAX_HISTORY_SIZE;
                     history.drain(..drain_count);
                 }
                 println!("[Orchestrator] Updated history: {:?}", history);
 
-                // --- 新增：在最终返回前，更新“最后一次交互”的缓存 ---
                 *self.last_full_interaction.lock().unwrap() = Some((text.to_string(), final_response.clone()));
 
                 Ok(Response::Text(final_response))

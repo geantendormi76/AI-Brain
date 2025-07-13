@@ -6,6 +6,7 @@ edition = "2021"
 [dependencies]
 memos_core = { path = "../memos_core" }
 agent_memos = { path = "../agent_memos" }
+micromodels = { workspace = true }
 
 # 其他通用依赖
 anyhow = "1.0"

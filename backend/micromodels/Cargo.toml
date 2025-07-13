@@ -14,7 +14,7 @@ serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 
 # 【核心策略变更】: 明确、完整地指定我们唯一的选择：2.0.0-rc.10
-ort = "2.0.0-rc.10" 
+ort = { version = "2.0.0-rc.10", default-features = false }
 
 jieba-rs = "0.6"
 ndarray = "0.15"

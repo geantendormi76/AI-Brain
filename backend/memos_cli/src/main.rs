@@ -5,6 +5,7 @@ use rustyline::DefaultEditor;
 use sysinfo::System;
 // 引入标准库中的 env 模块来处理环境变量
 use std::env;
+use std::path::Path;
 
 #[tokio::main]
 async fn main() -> Result<(), anyhow::Error> {
@@ -38,6 +39,20 @@ async fn main() -> Result<(), anyhow::Error> {
     };
     // =================================================================
 
+    let models_path_str = "models";// 从 memos_cli 目录出发，返回上一层到 backend，再进入 models
+    let models_path = Path::new(models_path_str);
+    let models_path = match models_path.canonicalize() {
+        Ok(path) => {
+            println!("[CLI] Found models path at: {:?}", path);
+            path
+        }
+        Err(e) => {
+            eprintln!("CRITICAL ERROR: Could not find models directory at '{}'.", models_path_str);
+            eprintln!("Please ensure the 'models' directory exists relative to the 'backend' directory.");
+            eprintln!("Underlying error: {}", e);
+            std::process::exit(1); // 错误无法恢复，直接退出程序
+        }
+    };
     let qdrant_url = "http://localhost:6334";
     let llm_url = "http://localhost:8282";
     let embedding_url = "http://localhost:8181";
@@ -45,7 +60,7 @@ async fn main() -> Result<(), anyhow::Error> {
     let agents: Vec<Box<dyn Agent>> = vec![Box::new(memos_agent)];
     println!("Agents loaded: {} agent(s)", agents.len());
 
-    let orchestrator = Orchestrator::new(agents, llm_url, reranker_llm_url);
+    let orchestrator = Orchestrator::new(agents, llm_url, reranker_llm_url, &models_path);
     println!("Orchestrator created.");
     println!("\n欢迎使用 Memos 智能助理 (CLI版)");
     println!("请输入您的指令 (例如: '帮我记一下明天要开会'), 输入 'exit' 或按 Ctrl+C 退出。");

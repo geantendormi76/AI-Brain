@@ -17,6 +17,7 @@ use tower_http::{cors::{Any, CorsLayer}, trace::TraceLayer};
 use std::sync::Arc;
 use tokio::task; // 导入 tokio::task
 use common_utils::{detect_performance_mode, PerformanceMode, load_default_urls};
+use std::path::Path;
 
 // API 层 DTOs (保持不变)
 #[derive(Serialize)] #[serde(rename_all = "PascalCase")] struct ApiResponse { text: String }
@@ -76,6 +77,20 @@ async fn dispatch_handler(
 async fn main() -> anyhow::Result<()> {
     println!("[Server] Initializing...");
 
+    let models_path_str = "models"; // 从 server 目录出发，返回上一层到 backend，再进入 models
+    let models_path = Path::new(models_path_str);
+    let models_path = match models_path.canonicalize() {
+        Ok(path) => {
+            println!("[CLI] Found models path at: {:?}", path);
+            path
+        }
+        Err(e) => {
+            eprintln!("CRITICAL ERROR: Could not find models directory at '{}'.", models_path_str);
+            eprintln!("Please ensure the 'models' directory exists relative to the 'backend' directory.");
+            eprintln!("Underlying error: {}", e);
+            std::process::exit(1); // 错误无法恢复，直接退出程序
+        }
+    };
     // 使用 common_utils 加载默认的服务URL
     let mut service_urls = load_default_urls();
 
@@ -102,7 +117,8 @@ async fn main() -> anyhow::Result<()> {
     let orchestrator = Orchestrator::new(
         agents, 
         &service_urls.llm_url, 
-        service_urls.reranker_url.as_deref() // 使用 as_deref 传递 Option<&str>
+        service_urls.reranker_url.as_deref(),
+        &models_path // <-- 新增的参数
     );
 
     let shared_state = Arc::new(orchestrator);
