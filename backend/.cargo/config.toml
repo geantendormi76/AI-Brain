@@ -1,3 +1,9 @@
-[target.x86_64-pc-windows-gnu]
-linker = "x86_64-w64-mingw32-gcc"
-ar = "x86_64-w64-mingw32-ar"
+# C:\zhzai\AI\backend\.cargo\config.toml (修正版)
+
+# 为所有在此目录下执行的cargo命令，设置构建时环境变量
+[env]
+
+# 核心修正：
+# 明确告知 ort crate 的构建脚本，我们手动下载的ONNX Runtime库文件所在的目录。
+# 这是解决 LNK1181 链接错误的根本方法。
+ORT_LIB_LOCATION = "C:/zhzai/AI/ort_libs/lib"

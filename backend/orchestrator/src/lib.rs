@@ -81,17 +81,17 @@ impl Orchestrator {
 
         // 加载问题分类器
         let is_question_model_path = models_path.join("is_question_classifier.onnx");
-        let is_question_data_path = models_path.join("is_question_preprocessor_data.json");
+        let is_question_data_path = models_path.join("is_question_preprocessor.bin");
         let is_question_classifier = Classifier::load(
             is_question_model_path,
-            is_question_data_path,
-            vec![MicroIntent::Question, MicroIntent::Statement, MicroIntent::Unknown] // 确保包含所有可能的标签
+            is_question_data_path, // <--- 修正为正确的变量名
+            vec![MicroIntent::Question, MicroIntent::Statement, MicroIntent::Unknown]
         ).expect("CRITICAL: Failed to load is_question classifier.");
         println!("[Orchestrator] 'is_question_classifier' loaded successfully.");
 
         // 加载确认分类器
         let confirmation_model_path = models_path.join("confirmation_classifier.onnx");
-        let confirmation_data_path = models_path.join("confirmation_preprocessor_data.json");
+        let confirmation_data_path = models_path.join("confirmation_preprocessor.bin");
         let confirmation_classifier = Classifier::load(
             confirmation_model_path,
             confirmation_data_path,
@@ -350,54 +350,60 @@ impl Orchestrator {
     pub async fn dispatch(&self, command: &Command) -> Result<Response, anyhow::Error> {
         match command {
             Command::ProcessText(text) => {
-                // --- V9.7 最终版：使用微模型进行第一层路由 ---
-                println!("[Orchestrator] Using 'is_question_classifier' for routing...");
-                
-                // 1. 正确地从 Mutex 获取可变借用并调用 predict
-                let intent = self.is_question_classifier.lock().unwrap().predict(text);
+                // --- V10.2 最终版：具备状态管理的、三层分级路由策略 ---
+                println!("[Orchestrator] V10.2 Routing with State-Aware strategy...");
 
-                // 2. 根据微模型的分类结果，直接调用对应的专家函数
-                let final_response = match intent {
-                    MicroIntent::Question => {
-                        println!("[Orchestrator] Micromodel classified as 'Question'. Routing to RecallExpert.");
-                        // 在调用专家前，清理可能存在的pending_action
-                        *self.pending_action.lock().unwrap() = None;
-                        self.handle_recall(text).await?
-                    }
-                    MicroIntent::Statement => {
-                        // 对于陈述句，我们还需要进一步判断是保存、修改还是删除
-                        // 这里我们暂时简化，先实现最常见的“保存”
-                        // 并且在调用专家前，清理可能存在的pending_action
-                        println!("[Orchestrator] Micromodel classified as 'Statement'.");
-                        *self.pending_action.lock().unwrap() = None;
-                        
-                        // 简单的关键词判断来分流 Statement
-                        let modify_keywords = ["修改", "改成", "更新", "编辑"];
-                        let delete_keywords = ["删除", "忘掉", "去掉", "移除"];
+                let final_response: String;
 
-                        if modify_keywords.iter().any(|&kw| text.contains(kw)) {
-                            println!("[Orchestrator] Heuristic Route: Detected ModifyTool from Statement.");
-                            self.handle_modify(text).await?
-                        } else if delete_keywords.iter().any(|&kw| text.contains(kw)) {
-                            println!("[Orchestrator] Heuristic Route: Detected DeleteTool from Statement.");
-                            self.handle_delete(text).await?
-                        } else {
-                            println!("[Orchestrator] Defaulting Statement to SaveExpert.");
-                            self.handle_save(text).await?
-                        }
-                    }
-                    MicroIntent::Affirm | MicroIntent::Deny => {
-                        // 如果主意图是确认/否定，直接路由到确认处理器
-                        println!("[Orchestrator] Micromodel classified as 'Affirm/Deny'. Routing to ConfirmationHandler.");
-                        self.handle_confirmation(text).await?
-                    }
-                    MicroIntent::Unknown => {
-                        println!("[Orchestrator] Micromodel classification is 'Unknown'. Using fallback response.");
-                        "抱歉，我不太明白您的意思，可以换个方式说吗？".to_string()
-                    }
-                };
+                // 1. "海马体"层：优先检查是否存在待处理的上下文动作 (PendingAction)。
+                // 我们克隆一份，如果后续处理失败，可以再把它放回去。
+                let pending_action = self.pending_action.lock().unwrap().clone();
 
-                // --- 3. 统一处理历史记录和上下文缓存 ---
+                if pending_action.is_some() {
+                    // 如果存在待处理动作，说明我们正处于一个多轮对话中。
+                    // 此时用户的输入（如“是的”、“取消”）应被直接路由到确认处理器。
+                    println!("[Orchestrator] Pending action found. Routing to ConfirmationHandler.");
+                    final_response = self.handle_confirmation(text).await?;
+
+                } else {
+                    // 2. "脑干"层：如果没有待处理动作，再检查是否为高优先级核心指令。
+                    let modify_keywords = ["修改", "改成", "更新", "编辑"];
+                    let delete_keywords = ["删除", "忘掉", "去掉", "移除"];
+
+                    if modify_keywords.iter().any(|&kw| text.contains(kw)) {
+                        println!("[Orchestrator] Heuristic Route: Detected ModifyTool. Routing to ModifyExpert.");
+                        final_response = self.handle_modify(text).await?;
+
+                    } else if delete_keywords.iter().any(|&kw| text.contains(kw)) {
+                        println!("[Orchestrator] Heuristic Route: Detected DeleteTool. Routing to DeleteExpert.");
+                        final_response = self.handle_delete(text).await?;
+
+                    } else {
+                        // 3. "小脑"层：如果以上都不是，才将任务交给微模型进行常规分类。
+                        println!("[Orchestrator] No pending action or heuristic hit. Falling back to 'is_question_classifier'...");
+                        let intent = self.is_question_classifier.lock().unwrap().predict(text);
+
+                        final_response = match intent {
+                            MicroIntent::Question => {
+                                println!("[Orchestrator] Micromodel classified as 'Question'. Routing to RecallExpert.");
+                                self.handle_recall(text).await?
+                            }
+                            MicroIntent::Statement => {
+                                println!("[Orchestrator] Micromodel classified as 'Statement'. Routing to SaveExpert.");
+                                self.handle_save(text).await?
+                            }
+                            // 【关键修正】在这一层，Affirm/Deny 意图被视为无上下文的回答。
+                            MicroIntent::Affirm | MicroIntent::Deny => {
+                                "嗯？我们刚才有在讨论什么需要确认的事情吗？".to_string()
+                            }
+                            MicroIntent::Unknown => {
+                                "抱歉，我不太明白您的意思，可以换个方式说吗？".to_string()
+                            }
+                        };
+                    }
+                }
+
+                // --- 统一处理历史记录和上下文缓存 (保持不变) ---
                 let mut history = self.conversation_history.lock().unwrap();
                 history.push(format!("User: {}", text));
                 history.push(format!("Assistant: {}", final_response));
