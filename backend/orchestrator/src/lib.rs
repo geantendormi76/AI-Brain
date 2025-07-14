@@ -24,7 +24,22 @@ use std::io::Write;
 pub enum PendingActionType {
     ModifyConfirmation { memory_id: i64, original_content: String },
     DeleteConfirmation { memory_id: i64, content_to_delete: String },
+    // --- 新增状态：等待用户从多个选项中澄清 ---
+    Clarification { 
+        // 存储候选记忆的ID和内容，用于向用户展示
+        options: Vec<(i64, String)>, 
+        // 存储原始意图，以便用户做出选择后，我们知道是该修改还是删除
+        original_intent: ClarifiableIntent,
+    },
 }
+
+// --- 新增枚举：定义哪些意图是需要澄清的 ---
+#[derive(Debug, Clone, Copy)]
+pub enum ClarifiableIntent {
+    Modify,
+    Delete,
+}
+
 
 #[derive(Debug, Clone)]
 pub struct PendingAction {
@@ -44,7 +59,12 @@ pub enum ContextualAction {
     /// 上一次是保存操作，我们记录了被保存记忆的ID
     Save { memory_id: i64 },
     /// 上一次是召回操作，我们记录了被召回记忆的ID和内容
-    Recall { memory_id: i64, content: String },
+    Recall { 
+        memory_id: i64, 
+        content: String,
+        // --- 新增字段：存储从召回内容中提取出的核心实体 ---
+        entities: Vec<String>,
+    },
 }
 
 /// 定义了“短期上下文”这个小记事本本身
@@ -150,13 +170,23 @@ impl Orchestrator {
     }
 
 
-    async fn handle_recall(&self, text: &str) -> Result<String, anyhow::Error> {
+async fn handle_recall(&self, text: &str) -> Result<String, anyhow::Error> {
         println!("[RecallExpert] Received recall request for: '{}'", text);
-        let memos_agent = self.agents.iter().find_map(|a| a.as_any().downcast_ref::<MemosAgent>()).ok_or_else(|| anyhow::anyhow!("MemosAgent not found"))?;
-        let candidate_points = memos_agent.recall(text).await?;
+        
+        let memos_agent = self.agents.iter()
+            .find_map(|a| a.as_any().downcast_ref::<MemosAgent>())
+            .ok_or_else(|| anyhow::anyhow!("MemosAgent not found"))?;
+        
+        // 初次召回，不带任何上下文
+        let candidate_points = memos_agent.recall(text, None).await?;
+        
         if candidate_points.is_empty() {
             return Ok(format!("关于“{}”，我好像没什么印象...", text));
         }
+
+        let final_content: String;
+        let top_point: &qdrant_client::qdrant::ScoredPoint;
+
         if let Some(reranker) = &self.reranker {
             println!("[RecallExpert] Re-ranking candidates...");
             let documents_to_rank: Vec<DocumentToRank> = candidate_points.iter()
@@ -165,102 +195,275 @@ impl Orchestrator {
             let rerank_request = ReRankRequest { query: text, documents: documents_to_rank };
             let strategy = ReRankStrategy::ValidateTopOne { threshold: 0.1 };
             let final_results = reranker.rank(rerank_request, strategy).await?;
+
             if let Some(top_doc) = final_results.get(0) {
-                Ok(top_doc.text.clone())
+                top_point = candidate_points.iter().find(|p| {
+                    p.payload.get("content").and_then(|v| v.as_str()) == Some(&top_doc.text)
+                }).unwrap();
+                final_content = top_doc.text.clone();
             } else {
                 let summary: Vec<String> = candidate_points.iter().take(3)
                     .filter_map(|p| p.payload.get("content").and_then(|v| v.as_str()).map(|s| format!("- {}", s)))
                     .collect();
-                Ok(format!("关于“{}”，我没有找到直接答案，但发现一些可能相关的内容：\n{}", text, summary.join("\n")))
+                return Ok(format!("关于“{}”，我没有找到直接答案，但发现一些可能相关的内容：\n{}", text, summary.join("\n")));
             }
         } else {
             println!("[RecallExpert] Skipping re-ranking.");
-            let top_point = candidate_points.get(0).unwrap();
-            let content = top_point.payload.get("content")
-                                   .and_then(|v| v.as_str())
-                                   .map_or("".to_string(), |v| v.to_string());
-            Ok(content)
+            top_point = candidate_points.get(0).unwrap();
+            final_content = top_point.payload.get("content")
+                                .and_then(|v| v.as_str())
+                                .map_or("".to_string(), |v| v.to_string());
         }
+
+        let memory_id = top_point.id.as_ref().and_then(|id| match &id.point_id_options {
+            Some(qdrant_client::qdrant::point_id::PointIdOptions::Num(num)) => Some(*num as i64),
+            _ => None,
+        }).unwrap_or(-1);
+
+        // --- 核心修复：不再依赖 payload，而是对成功召回的内容主动进行NER，以获取最准确的上下文实体 ---
+        let memos_agent_for_ner = self.agents.iter()
+            .find_map(|a| a.as_any().downcast_ref::<MemosAgent>())
+            .ok_or_else(|| anyhow::anyhow!("MemosAgent not found for context NER"))?;
+        
+        // 对最终确认的召回内容，通过新的公共方法提取实体
+        let entities = memos_agent_for_ner.extract_entities(&final_content)?;
+        println!("[Orchestrator-DST] Extracted entities for context: {:?}", entities);
+        // --- 修复结束 ---
+
+        let context = InteractionContext {
+            last_action: ContextualAction::Recall {
+                memory_id,
+                content: final_content.clone(),
+                entities,
+            },
+        };
+        *self.last_interaction_context.lock().unwrap() = Some(context);
+        println!("[Orchestrator-DST] Updated context: Last action was Recall with ID {} and content '{}'", memory_id, final_content);
+
+        Ok(final_content)
     }
 
     async fn handle_modify(&self, text: &str) -> Result<String, anyhow::Error> {
         println!("[ModifyExpert-Phase1] Received request: '{}'", text);
+        
+        // --- 指代消解逻辑 START (V2 - 意图驱动) ---
+        println!("[Orchestrator-DST] Modify intent detected. Attempting to use context regardless of pronouns.");
+        // 直接尝试从上一次交互中获取实体，不再需要判断输入中是否包含代词。
+        let context_entities: Option<Vec<String>> = self.last_interaction_context.lock().unwrap()
+            .as_ref()
+            .and_then(|ctx| match &ctx.last_action {
+                // 如果上次是召回操作，并且成功提取了实体，就使用它们
+                ContextualAction::Recall { entities, .. } if !entities.is_empty() => {
+                    println!("[Orchestrator-DST] Found context entities: {:?}", entities);
+                    Some(entities.clone())
+                },
+                _ => None,
+            });
+        // --- 指代消解逻辑 END ---
+
         let memos_agent = self.agents.iter()
             .find_map(|a| a.as_any().downcast_ref::<MemosAgent>())
             .ok_or_else(|| anyhow::anyhow!("MemosAgent not found"))?;
-        let candidate_points = memos_agent.recall(text).await?;
-        if let Some(top_point) = candidate_points.get(0) {
-            let memory_id = top_point.id.as_ref().and_then(|id| match &id.point_id_options {
-                Some(qdrant_client::qdrant::point_id::PointIdOptions::Num(num)) => Some(*num as i64),
-                _ => None,
-            }).ok_or_else(|| anyhow::anyhow!("Found a point without a numeric ID"))?;
-            let content = top_point.payload.get("content")
-                .and_then(|v| v.as_str())
-                .map_or("无法解析内容".to_string(), |v| v.to_string());
-            let pending_action = PendingAction {
-                action_type: PendingActionType::ModifyConfirmation { 
-                    memory_id, 
-                    original_content: content.clone()
-                },
-                original_user_request: text.to_string(),
-            };
-            *self.pending_action.lock().unwrap() = Some(pending_action);
-            println!("[Orchestrator] Pending action set: ModifyConfirmation for ID {}", memory_id);
-            let response_text = format!("您是想修改这条记忆吗？\n\n---\n{}\n---", content);
-            Ok(response_text)
-        } else {
-            Ok("抱歉，我没有找到与您描述相关的记忆。".to_string())
+
+        // 将原始用户输入和（可能存在的）上下文实体，分别传递给 recall 函数
+        let candidate_points = memos_agent.recall(text, context_entities).await?;
+        
+        match candidate_points.len() {
+            0 => Ok("抱歉，我没有找到与您描述相关的记忆。".to_string()),
+            1 => {
+                // 行为不变：只有一个匹配项，直接进入确认流程
+                let top_point = candidate_points.get(0).unwrap();
+                let memory_id = top_point.id.as_ref().and_then(|id| match &id.point_id_options {
+                    Some(qdrant_client::qdrant::point_id::PointIdOptions::Num(num)) => Some(*num as i64),
+                    _ => None,
+                }).ok_or_else(|| anyhow::anyhow!("Found a point without a numeric ID"))?;
+                let content = top_point.payload.get("content")
+                    .and_then(|v| v.as_str())
+                    .map_or("无法解析内容".to_string(), |v| v.to_string());
+                
+                let pending_action = PendingAction {
+                    action_type: PendingActionType::ModifyConfirmation { 
+                        memory_id, 
+                        original_content: content.clone()
+                    },
+                    original_user_request: text.to_string(),
+                };
+                *self.pending_action.lock().unwrap() = Some(pending_action);
+                println!("[Orchestrator] Pending action set: ModifyConfirmation for ID {}", memory_id);
+                
+                Ok(format!("您是想修改这条记忆吗？\n\n---\n{}\n---", content))
+            }
+            _ => {
+                // 核心改造：有多个匹配项，进入澄清流程
+                println!("[Orchestrator] Multiple candidates found. Entering clarification mode.");
+                let options: Vec<(i64, String)> = candidate_points.into_iter().filter_map(|p| {
+                    let id = p.id.as_ref()?.point_id_options.as_ref()?;
+                    let content = p.payload.get("content")?.as_str()?;
+                    if let qdrant_client::qdrant::point_id::PointIdOptions::Num(num) = id {
+                        Some((*num as i64, content.to_string()))
+                    } else {
+                        None
+                    }
+                }).collect();
+
+                let pending_action = PendingAction {
+                    action_type: PendingActionType::Clarification {
+                        options: options.clone(),
+                        original_intent: ClarifiableIntent::Modify,
+                    },
+                    original_user_request: text.to_string(),
+                };
+                *self.pending_action.lock().unwrap() = Some(pending_action);
+
+                let options_text = options.iter().enumerate()
+                    .map(|(i, (_, content))| format!("{}. {}", i + 1, content))
+                    .collect::<Vec<_>>()
+                    .join("\n");
+
+                Ok(format!("我找到了多条相关记忆，您想修改哪一条？\n\n{}", options_text))
+            }
         }
     }
 
     async fn handle_delete(&self, text: &str) -> Result<String, anyhow::Error> {
         println!("[DeleteExpert-Phase1] Received request: '{}'", text);
+
+        // --- 指代消解逻辑 START (V2 - 意图驱动) ---
+        println!("[Orchestrator-DST] Delete intent detected. Attempting to use context regardless of pronouns.");
+        // 直接尝试从上一次交互中获取实体
+        let context_entities: Option<Vec<String>> = self.last_interaction_context.lock().unwrap()
+            .as_ref()
+            .and_then(|ctx| match &ctx.last_action {
+                ContextualAction::Recall { entities, .. } if !entities.is_empty() => {
+                    println!("[Orchestrator-DST] Found context entities: {:?}", entities);
+                    Some(entities.clone())
+                },
+                _ => None,
+            });
+        // --- 指代消解逻辑 END ---
+
         let memos_agent = self.agents.iter()
             .find_map(|a| a.as_any().downcast_ref::<MemosAgent>())
             .ok_or_else(|| anyhow::anyhow!("MemosAgent not found"))?;
-        let candidate_points = memos_agent.recall(text).await?;
-        if let Some(top_point) = candidate_points.get(0) {
-            let memory_id = top_point.id.as_ref().and_then(|id| match &id.point_id_options {
-                Some(qdrant_client::qdrant::point_id::PointIdOptions::Num(num)) => Some(*num as i64),
-                _ => None,
-            }).ok_or_else(|| anyhow::anyhow!("Found a point without a numeric ID"))?;
-            let content = top_point.payload.get("content")
-                .and_then(|v| v.as_str())
-                .map_or("无法解析内容".to_string(), |v| v.to_string());
-            let pending_action = PendingAction {
-                action_type: PendingActionType::DeleteConfirmation { 
-                    memory_id, 
-                    content_to_delete: content.clone() 
-                },
-                original_user_request: text.to_string(),
-            };
-            *self.pending_action.lock().unwrap() = Some(pending_action);
-            println!("[Orchestrator] Pending action set: DeleteConfirmation for ID {}", memory_id);
-            let response_text = format!("您确定要删除这条记忆吗？\n\n---\n{}\n---", content);
-            Ok(response_text)
-        } else {
-            Ok("抱歉，我没有找到与您描述相关的记忆可以删除。".to_string())
+
+        // 将原始用户输入和（可能存在的）上下文实体，分别传递给 recall 函数
+        let candidate_points = memos_agent.recall(text, context_entities).await?;
+
+        match candidate_points.len() {
+            0 => Ok("抱歉，我没有找到与您描述相关的记忆可以删除。".to_string()),
+            1 => {
+                // 行为不变：只有一个匹配项
+                let top_point = candidate_points.get(0).unwrap();
+                let memory_id = top_point.id.as_ref().and_then(|id| match &id.point_id_options {
+                    Some(qdrant_client::qdrant::point_id::PointIdOptions::Num(num)) => Some(*num as i64),
+                    _ => None,
+                }).ok_or_else(|| anyhow::anyhow!("Found a point without a numeric ID"))?;
+                let content = top_point.payload.get("content")
+                    .and_then(|v| v.as_str())
+                    .map_or("无法解析内容".to_string(), |v| v.to_string());
+                
+                let pending_action = PendingAction {
+                    action_type: PendingActionType::DeleteConfirmation { 
+                        memory_id, 
+                        content_to_delete: content.clone() 
+                    },
+                    original_user_request: text.to_string(),
+                };
+                *self.pending_action.lock().unwrap() = Some(pending_action);
+                
+                Ok(format!("您确定要删除这条记忆吗？\n\n---\n{}\n---", content))
+            }
+            _ => {
+                // 核心改造：有多个匹配项
+                println!("[Orchestrator] Multiple candidates found. Entering clarification mode for deletion.");
+                let options: Vec<(i64, String)> = candidate_points.into_iter().filter_map(|p| {
+                    let id = p.id.as_ref()?.point_id_options.as_ref()?;
+                    let content = p.payload.get("content")?.as_str()?;
+                    if let qdrant_client::qdrant::point_id::PointIdOptions::Num(num) = id {
+                        Some((*num as i64, content.to_string()))
+                    } else {
+                        None
+                    }
+                }).collect();
+
+                let pending_action = PendingAction {
+                    action_type: PendingActionType::Clarification {
+                        options: options.clone(),
+                        original_intent: ClarifiableIntent::Delete,
+                    },
+                    original_user_request: text.to_string(),
+                };
+                *self.pending_action.lock().unwrap() = Some(pending_action);
+
+                let options_text = options.iter().enumerate()
+                    .map(|(i, (_, content))| format!("{}. {}", i + 1, content))
+                    .collect::<Vec<_>>()
+                    .join("\n");
+
+                Ok(format!("我找到了多条相关记忆，您想删除哪一条？\n\n{}", options_text))
+            }
         }
     }
     
     async fn handle_confirmation(&self, text: &str) -> Result<String, anyhow::Error> {
-        let pending_action = self.pending_action.lock().unwrap().take();
-        if let Some(action) = pending_action {
-            let intent = self.confirmation_classifier.lock().unwrap().predict(text);
-            
-            match intent {
-                MicroIntent::Affirm => {
-                    println!("[ConfirmationExpert] Micromodel classified as 'Affirm'. Executing pending action.");
-                    self.execute_pending_action(action).await
-                }
-                MicroIntent::Deny => {
-                    println!("[ConfirmationExpert] Micromodel classified as 'Deny'. Cancelling pending action.");
+        // 1. 先取出当前的待办事项
+        let taken_action = self.pending_action.lock().unwrap().take();
+
+        if let Some(action) = taken_action {
+            match action.action_type {
+                PendingActionType::Clarification { options, original_intent } => {
+                    let choice = text.trim().parse::<usize>().ok();
+                    if let Some(choice_idx) = choice.and_then(|c| c.checked_sub(1)) {
+                        if let Some((chosen_id, chosen_content)) = options.get(choice_idx) {
+                            // 用户做出了有效选择，我们创建一个新的、更具体的待办事项
+                            let new_action_type = match original_intent {
+                                ClarifiableIntent::Modify => PendingActionType::ModifyConfirmation {
+                                    memory_id: *chosen_id,
+                                    original_content: chosen_content.clone(),
+                                },
+                                ClarifiableIntent::Delete => PendingActionType::DeleteConfirmation {
+                                    memory_id: *chosen_id,
+                                    content_to_delete: chosen_content.clone(),
+                                },
+                            };
+                            let new_pending_action = PendingAction {
+                                action_type: new_action_type,
+                                original_user_request: action.original_user_request,
+                            };
+                            
+                            // --- 修复：重新获取锁，并将新的待办事项放回去 ---
+                            *self.pending_action.lock().unwrap() = Some(new_pending_action);
+                            
+                            // 生成确认问题并返回
+                            let confirmation_prompt = match original_intent {
+                                ClarifiableIntent::Modify => format!("您是想修改这条记忆吗？\n\n---\n{}\n---", chosen_content),
+                                ClarifiableIntent::Delete => format!("您确定要删除这条记忆吗？\n\n---\n{}\n---", chosen_content),
+                            };
+                            return Ok(confirmation_prompt);
+                        }
+                    }
+                    println!("[ConfirmationExpert] User input '{}' is not a valid choice. Cancelling.", text);
                     Ok("好的，已取消操作。".to_string())
                 }
-                _ => { // 处理 Unclear 和其他所有情况
-                    println!("[ConfirmationExpert] Micromodel response unclear. Re-instating pending action.");
-                    *self.pending_action.lock().unwrap() = Some(action);
-                    Ok("抱歉，我没太明白。请明确回复“是”或“否”。".to_string())
+                
+                PendingActionType::ModifyConfirmation { .. } | PendingActionType::DeleteConfirmation { .. } => {
+                    let intent = self.confirmation_classifier.lock().unwrap().predict(text);
+                    match intent {
+                        MicroIntent::Affirm => {
+                            println!("[ConfirmationExpert] Micromodel classified as 'Affirm'. Executing pending action.");
+                            self.execute_pending_action(action).await
+                        }
+                        MicroIntent::Deny => {
+                            println!("[ConfirmationExpert] Micromodel classified as 'Deny'. Cancelling pending action.");
+                            Ok("好的，已取消操作。".to_string())
+                        }
+                        _ => {
+                            println!("[ConfirmationExpert] Micromodel response unclear. Re-instating pending action.");
+                            // 如果不清楚，把 action 放回去
+                            *self.pending_action.lock().unwrap() = Some(action);
+                            Ok("抱歉，我没太明白。请明确回复“是”或“否”，或者您想操作的选项编号。".to_string())
+                        }
+                    }
                 }
             }
         } else {
@@ -268,53 +471,59 @@ impl Orchestrator {
         }
     }
 
-
-
-
     async fn execute_pending_action(&self, action: PendingAction) -> Result<String, anyhow::Error> {
-        match action.action_type {
-            PendingActionType::ModifyConfirmation { memory_id, original_content } => {
-                println!("[ModifyExpert-Phase2] Executing modification for ID: {}", memory_id);
-                
-                // 定义解析LLM响应所需的本地结构体
-                #[derive(Deserialize)] struct ChatChoice { message: ChatMessageContent }
-                #[derive(Deserialize)] struct ChatMessageContent { content: String }
-                #[derive(Deserialize)] struct ChatCompletionResponse { choices: Vec<ChatChoice> }
+            match action.action_type {
+                PendingActionType::ModifyConfirmation { memory_id, original_content } => {
+                    // ... (此部分代码保持不变)
+                    println!("[ModifyExpert-Phase2] Executing modification for ID: {}", memory_id);
+                    
+                    #[derive(Deserialize)] struct ChatChoice { message: ChatMessageContent }
+                    #[derive(Deserialize)] struct ChatMessageContent { content: String }
+                    #[derive(Deserialize)] struct ChatCompletionResponse { choices: Vec<ChatChoice> }
 
-                let messages = modify_expert::get_text_modification_prompt(&original_content, &action.original_user_request);
-                let gbnf_schema = modify_expert::get_text_modification_gbnf_schema();
-                let request_body = json!({ "messages": messages, "temperature": 0.0, "grammar": gbnf_schema });
-                let chat_url = format!("{}/v1/chat/completions", self.llm_config.llm_url);
-                let response = self.llm_config.client.post(&chat_url).json(&request_body).send().await?;
-                
-                let chat_response: ChatCompletionResponse = response.json().await?;
-                let content_str = chat_response.choices.get(0).map(|c| c.message.content.trim())
-                    .ok_or_else(|| anyhow::anyhow!("Modify LLM response is empty"))?;
-                
-                let modified_text_obj: modify_expert::ModifiedText = serde_json::from_str(content_str)?;
-                let new_content = &modified_text_obj.modified_text;
-                
-                println!("[ModifyExpert-Phase2] LLM generated new text: '{}'", new_content);
-                
-                let memos_agent = self.agents.iter()
-                    .find_map(|a| a.as_any().downcast_ref::<MemosAgent>())
-                    .ok_or_else(|| anyhow::anyhow!("MemosAgent not found"))?;
-                
-                memos_agent.update(memory_id, new_content).await?;
-                Ok("好的，我已经更新了这条记忆。".to_string())
-            }
-            PendingActionType::DeleteConfirmation { memory_id, .. } => {
-                println!("[DeleteExpert-Phase2] Executing deletion for ID: {}", memory_id);
-                
-                let memos_agent = self.agents.iter()
-                    .find_map(|a| a.as_any().downcast_ref::<MemosAgent>())
-                    .ok_or_else(|| anyhow::anyhow!("MemosAgent not found"))?;
-                
-                memos_agent.delete(memory_id).await?;
-                Ok("好的，我已经删除了这条记忆。".to_string())
+                    let messages = modify_expert::get_text_modification_prompt(&original_content, &action.original_user_request);
+                    let gbnf_schema = modify_expert::get_text_modification_gbnf_schema();
+                    let request_body = json!({ "messages": messages, "temperature": 0.0, "grammar": gbnf_schema });
+                    let chat_url = format!("{}/v1/chat/completions", self.llm_config.llm_url);
+                    let response = self.llm_config.client.post(&chat_url).json(&request_body).send().await?;
+                    
+                    let chat_response: ChatCompletionResponse = response.json().await?;
+                    let content_str = chat_response.choices.get(0).map(|c| c.message.content.trim())
+                        .ok_or_else(|| anyhow::anyhow!("Modify LLM response is empty"))?;
+                    
+                    let modified_text_obj: modify_expert::ModifiedText = serde_json::from_str(content_str)?;
+                    let new_content = &modified_text_obj.modified_text;
+                    
+                    println!("[ModifyExpert-Phase2] LLM generated new text: '{}'", new_content);
+                    
+                    let memos_agent = self.agents.iter()
+                        .find_map(|a| a.as_any().downcast_ref::<MemosAgent>())
+                        .ok_or_else(|| anyhow::anyhow!("MemosAgent not found"))?;
+                    
+                    memos_agent.update(memory_id, new_content).await?;
+                    Ok("好的，我已经更新了这条记忆。".to_string())
+                }
+                PendingActionType::DeleteConfirmation { memory_id, .. } => {
+                    // ... (此部分代码保持不变)
+                    println!("[DeleteExpert-Phase2] Executing deletion for ID: {}", memory_id);
+                    
+                    let memos_agent = self.agents.iter()
+                        .find_map(|a| a.as_any().downcast_ref::<MemosAgent>())
+                        .ok_or_else(|| anyhow::anyhow!("MemosAgent not found"))?;
+                    
+                    memos_agent.delete(memory_id).await?;
+                    Ok("好的，我已经删除了这条记忆。".to_string())
+                }
+                // --- 修复：处理被遗漏的 Clarification 分支 ---
+                PendingActionType::Clarification { .. } => {
+                    // 这是一个逻辑错误，澄清动作不应该被“执行”。
+                    // 我们返回一个错误，而不是让程序崩溃。
+                    Err(anyhow::anyhow!(
+                        "[Logic Error] Attempted to execute a 'Clarification' action. This should not happen."
+                    ))
+                }
             }
         }
-    }
 
 
     pub fn handle_feedback(&self) {
@@ -361,22 +570,22 @@ impl Orchestrator {
                     final_response = self.handle_confirmation(text).await?;
                 } else {
                     // 2. "脑干"层：增强型启发式规则引擎。
-                    let lower_text = text.to_lowercase(); // 统一转为小写以简化匹配
-
-                    // 指令性关键词
+                    let lower_text = text.to_lowercase();
                     let modify_keywords = ["修改", "改成", "更新", "编辑"];
                     let delete_keywords = ["删除", "忘掉", "去掉", "移除"];
                     let save_keywords = ["记一下", "记录", "帮我记"];
 
+                    // --- 修复：补上被遗漏的 is_declarative 定义 ---
                     // 陈述性模式 (更智能的“保险丝”)
                     let is_declarative = (lower_text.contains("是") || lower_text.contains("为")) && !lower_text.contains('？') && !lower_text.contains('?');
 
                     if modify_keywords.iter().any(|&kw| lower_text.contains(kw)) {
                         println!("[Orchestrator] Heuristic Route: Detected ModifyTool.");
-                        final_response = self.handle_modify(text).await?;
+                        final_response = self.handle_modify(text).await?; // <-- 直接使用原始 text
                     } else if delete_keywords.iter().any(|&kw| lower_text.contains(kw)) {
                         println!("[Orchestrator] Heuristic Route: Detected DeleteTool.");
-                        final_response = self.handle_delete(text).await?;
+                        final_response = self.handle_delete(text).await?; // <-- 直接使用原始 text
+                        
                     } else if save_keywords.iter().any(|&kw| lower_text.contains(kw)) || is_declarative {
                         println!("[Orchestrator] Heuristic Route: Detected SaveTool by keyword or declarative pattern.");
                         final_response = self.handle_save(text).await?;

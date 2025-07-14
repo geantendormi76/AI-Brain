@@ -53,6 +53,10 @@ pub struct MemosAgent {
 
 
 impl MemosAgent {
+    pub fn extract_entities(&self, text: &str) -> Result<Vec<String>, anyhow::Error> {
+        self.ner_classifier.lock().unwrap().predict(text)
+    }
+
     pub async fn new(qdrant_url: &str, embedding_url: &str, models_path: &Path) -> Result<Self, anyhow::Error> {
         let home_dir = dirs::home_dir().ok_or_else(|| anyhow::anyhow!("Could not find home directory"))?;
         let db_dir = home_dir.join(".memos_agent");
@@ -147,41 +151,48 @@ impl MemosAgent {
     }
 
     // --- 【神经连接手术 - RECALL】 ---
-    pub async fn recall(&self, query_text: &str) -> Result<Vec<ScoredPoint>, anyhow::Error> {
+    pub async fn recall(&self, query_text: &str, context_entities: Option<Vec<String>>) -> Result<Vec<ScoredPoint>, anyhow::Error> {
         println!("[MemosAgent] Recalling for: '{}'", query_text);
 
-        // A. 判断是否为精确意图
         let is_precise_intent = query_text.contains("修改") || query_text.contains("删除") || query_text.contains("那条关于");
 
+        // --- 修复：优先使用从上下文传入的实体 ---
+        let entities_to_use = if let Some(entities) = context_entities {
+            // 如果上下文提供了实体，直接使用它们
+            println!("[MemosAgent] Using entities from context: {:?}", entities);
+            entities
+        } else {
+            // 否则，才从当前查询文本中提取实体
+            self.ner_classifier.lock().unwrap().predict(query_text)?
+        };
+        
         if is_precise_intent {
             println!("[MemosAgent] Precise intent detected. Attempting NER-based entity linking.");
             
-            // B. 从用户指令中提取实体
-            let entities: Vec<String> = self.ner_classifier.lock().unwrap().predict(query_text)?;
-            
-            println!("[MemosAgent-NER] Extracted entities from query: {:?}", entities);
+            println!("[MemosAgent-NER] Entities for search: {:?}", entities_to_use);
 
-            if !entities.is_empty() {
-                // C. 使用实体构建精确匹配的 Filter
+            if !entities_to_use.is_empty() {
                 let filter = Filter::must(
-                    entities.iter().map(|e| Condition::matches("entities", MatchValue::Text(e.clone())))
+                    entities_to_use.iter().map(|e| Condition::matches("entities", MatchValue::Text(e.clone())))
                 );
 
-                // D. 使用 scroll API 进行精确过滤查询
                 let scroll_response = self.qdrant_client.scroll(
                     qdrant_client::qdrant::ScrollPointsBuilder::new(COLLECTION_NAME.to_string()).filter(filter).limit(5).with_payload(true)
                 ).await?;
 
-                // E. 如果找到结果，直接返回，绕过模糊搜索
                 if !scroll_response.result.is_empty() {
-                    println!("[MemosAgent] Entity linking found {} precise results. Returning immediately.", scroll_response.result.len());
+                    println!("[MemosAgent-DB] Entity linking found {} precise results. Returning immediately.", scroll_response.result.len());
                     let precise_points: Vec<ScoredPoint> = scroll_response.result.into_iter().map(|p| ScoredPoint {
-                        id: p.id, payload: p.payload, score: 1.0, // 精确匹配，给满分
-                        version: 0, // RetrievedPoint 没有 version，我们提供一个默认值
+                        id: p.id, payload: p.payload, score: 1.0,
+                        version: 0,
                         vectors: p.vectors, order_value: p.order_value, shard_key: p.shard_key,
                     }).collect();
                     return Ok(precise_points);
+                } else {
+                    println!("[MemosAgent-DB] NER extracted entities, but no precise match found in Qdrant.");
                 }
+            } else {
+                println!("[MemosAgent-NER] No entities found for precise search.");
             }
         }
         

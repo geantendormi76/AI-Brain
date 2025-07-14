@@ -65,9 +65,7 @@ impl Classifier {
             let file = fs::File::open(&dict_path)?;
             let mut reader = BufReader::new(file);
             jieba.load_dict(&mut reader)?;
-            println!("[micromodels] Successfully loaded custom jieba dictionary from: {:?}", dict_path);
         } else {
-            println!("[micromodels] WARNING: dict.txt not found at {:?}. Using default embedded dictionary. This may cause minor inconsistencies with Python.", dict_path);
         }
 
         Ok(Self { 
@@ -127,8 +125,6 @@ impl Classifier {
         if let Some(label_str) = extracted_label {
             return self.map_str_to_intent(&label_str);
         }
-        
-        eprintln!("[micromodels] Failed to extract string label from ONNX output.");
         Intent::Unknown
     }
 
