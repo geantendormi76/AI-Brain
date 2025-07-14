@@ -350,37 +350,39 @@ impl Orchestrator {
     pub async fn dispatch(&self, command: &Command) -> Result<Response, anyhow::Error> {
         match command {
             Command::ProcessText(text) => {
-                // --- V10.2 最终版：具备状态管理的、三层分级路由策略 ---
-                println!("[Orchestrator] V10.2 Routing with State-Aware strategy...");
+                // --- V10.3 最终版：具备增强型启发式规则的、三层分级路由策略 ---
+                println!("[Orchestrator] V10.3 Routing with Enhanced Heuristics...");
 
                 let final_response: String;
 
-                // 1. "海马体"层：优先检查是否存在待处理的上下文动作 (PendingAction)。
-                // 我们克隆一份，如果后续处理失败，可以再把它放回去。
-                let pending_action = self.pending_action.lock().unwrap().clone();
-
-                if pending_action.is_some() {
-                    // 如果存在待处理动作，说明我们正处于一个多轮对话中。
-                    // 此时用户的输入（如“是的”、“取消”）应被直接路由到确认处理器。
+                // 1. "海马体"层：优先检查是否存在待处理的上下文动作。
+                if self.pending_action.lock().unwrap().is_some() {
                     println!("[Orchestrator] Pending action found. Routing to ConfirmationHandler.");
                     final_response = self.handle_confirmation(text).await?;
-
                 } else {
-                    // 2. "脑干"层：如果没有待处理动作，再检查是否为高优先级核心指令。
+                    // 2. "脑干"层：增强型启发式规则引擎。
+                    let lower_text = text.to_lowercase(); // 统一转为小写以简化匹配
+
+                    // 指令性关键词
                     let modify_keywords = ["修改", "改成", "更新", "编辑"];
                     let delete_keywords = ["删除", "忘掉", "去掉", "移除"];
+                    let save_keywords = ["记一下", "记录", "帮我记"];
 
-                    if modify_keywords.iter().any(|&kw| text.contains(kw)) {
-                        println!("[Orchestrator] Heuristic Route: Detected ModifyTool. Routing to ModifyExpert.");
+                    // 陈述性模式 (更智能的“保险丝”)
+                    let is_declarative = (lower_text.contains("是") || lower_text.contains("为")) && !lower_text.contains('？') && !lower_text.contains('?');
+
+                    if modify_keywords.iter().any(|&kw| lower_text.contains(kw)) {
+                        println!("[Orchestrator] Heuristic Route: Detected ModifyTool.");
                         final_response = self.handle_modify(text).await?;
-
-                    } else if delete_keywords.iter().any(|&kw| text.contains(kw)) {
-                        println!("[Orchestrator] Heuristic Route: Detected DeleteTool. Routing to DeleteExpert.");
+                    } else if delete_keywords.iter().any(|&kw| lower_text.contains(kw)) {
+                        println!("[Orchestrator] Heuristic Route: Detected DeleteTool.");
                         final_response = self.handle_delete(text).await?;
-
+                    } else if save_keywords.iter().any(|&kw| lower_text.contains(kw)) || is_declarative {
+                        println!("[Orchestrator] Heuristic Route: Detected SaveTool by keyword or declarative pattern.");
+                        final_response = self.handle_save(text).await?;
                     } else {
-                        // 3. "小脑"层：如果以上都不是，才将任务交给微模型进行常规分类。
-                        println!("[Orchestrator] No pending action or heuristic hit. Falling back to 'is_question_classifier'...");
+                        // 3. "小脑"层：如果以上规则都未命中，才将任务交给微模型。
+                        println!("[Orchestrator] No heuristic hit. Falling back to 'is_question_classifier'...");
                         let intent = self.is_question_classifier.lock().unwrap().predict(text);
 
                         final_response = match intent {
@@ -388,11 +390,11 @@ impl Orchestrator {
                                 println!("[Orchestrator] Micromodel classified as 'Question'. Routing to RecallExpert.");
                                 self.handle_recall(text).await?
                             }
+                            // 如果微模型也认为是Statement，那就一定是Save
                             MicroIntent::Statement => {
                                 println!("[Orchestrator] Micromodel classified as 'Statement'. Routing to SaveExpert.");
                                 self.handle_save(text).await?
                             }
-                            // 【关键修正】在这一层，Affirm/Deny 意图被视为无上下文的回答。
                             MicroIntent::Affirm | MicroIntent::Deny => {
                                 "嗯？我们刚才有在讨论什么需要确认的事情吗？".to_string()
                             }
@@ -403,19 +405,22 @@ impl Orchestrator {
                     }
                 }
 
-                // --- 统一处理历史记录和上下文缓存 (保持不变) ---
+                // --- 统一处理历史记录 (保持不变) ---
                 let mut history = self.conversation_history.lock().unwrap();
                 history.push(format!("User: {}", text));
                 history.push(format!("Assistant: {}", final_response));
                 const MAX_HISTORY_SIZE: usize = 8;
                 if history.len() > MAX_HISTORY_SIZE {
+                    // 1. 先进行不可变借用，计算出需要移除的数量，并将结果存到一个新变量中。
+                    // 在这行代码结束后，对 history.len() 的不可变借用就结束了。
                     let drain_count = history.len() - MAX_HISTORY_SIZE;
+                    
+                    // 2. 然后，再对 history 进行可变借用，执行 drain 操作。
+                    // 此时不存在任何不可变借用，操作是安全的。
                     history.drain(..drain_count);
                 }
                 println!("[Orchestrator] Updated history: {:?}", history);
-
                 *self.last_full_interaction.lock().unwrap() = Some((text.to_string(), final_response.clone()));
-
                 Ok(Response::Text(final_response))
             }
         }

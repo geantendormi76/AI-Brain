@@ -10,6 +10,7 @@ use r2d2_sqlite::SqliteConnectionManager;
 use r2d2::Pool;
 use chrono::Utc;
 use std::collections::HashMap;
+use std::collections::HashSet;
 // 2. 导入 qdrant 删除点所需的新类型
 use qdrant_client::qdrant::{PointStruct, Vector, VectorParamsBuilder, CreateCollectionBuilder, Distance, UpsertPointsBuilder, SearchPointsBuilder, ScoredPoint, point_id, vector::Vector as QdrantVectorEnums, DenseVector, PointsIdsList, DeletePointsBuilder};
 use qdrant_client::{Payload, Qdrant};
@@ -138,13 +139,56 @@ impl MemosAgent {
 
     // --- 全新的 `recall` 方法，零LLM调用 ---
     pub async fn recall(&self, query_text: &str) -> Result<Vec<ScoredPoint>, anyhow::Error> {
-        println!("[MemosAgent] Recalling V2.2 for: '{}'", query_text);
+        println!("[MemosAgent] Recalling V2.4 for: '{}'", query_text);
 
+        let is_precise_intent = query_text.contains("修改") || query_text.contains("删除");
+
+        if is_precise_intent {
+            println!("[MemosAgent] Precise intent detected. Attempting entity-based keyword search.");
+
+            // --- 【核心修正】智能实体关键词提取 ---
+            // 1. 定义指令性关键词，用于从查询中剥离
+            let command_keywords: HashSet<&str> = [
+                "修改", "改成", "更新", "编辑", "删除", "忘掉", "去掉", "移除", "帮我", "一下", "那条"
+            ].iter().cloned().collect();
+
+            // 2. 提取所有关键词，然后过滤掉指令性关键词，只保留实体关键词
+            let entity_keywords: Vec<String> = self.extract_keywords(query_text)
+                .into_iter()
+                .filter(|k| !command_keywords.contains(k.as_str()) && !k.trim().is_empty())
+                .collect();
+
+            println!("[MemosAgent] Extracted entity keywords: {:?}", entity_keywords);
+
+            if !entity_keywords.is_empty() {
+                use qdrant_client::qdrant::{r#match::MatchValue, Condition, Filter};
+                
+                // 3. 使用纯实体关键词构建精确匹配过滤器
+                let filter = Filter::must(
+                    entity_keywords.iter()
+                        .map(|k| Condition::matches("content", MatchValue::Text(k.clone())))
+                );
+
+                let scroll_response = self.qdrant_client.scroll(
+                    qdrant_client::qdrant::ScrollPointsBuilder::new(COLLECTION_NAME).filter(filter).limit(5).with_payload(true)
+                ).await?;
+
+                if !scroll_response.result.is_empty() {
+                    println!("[MemosAgent] Entity keyword search found {} precise results. Returning immediately.", scroll_response.result.len());
+                    let precise_points: Vec<ScoredPoint> = scroll_response.result.into_iter().map(|p| ScoredPoint {
+                        id: p.id, payload: p.payload, vectors: p.vectors, shard_key: p.shard_key, order_value: p.order_value,
+                        score: 1.0, version: 0,
+                    }).collect();
+                    return Ok(precise_points);
+                }
+            }
+        }
+        
+        println!("[MemosAgent] Precise search failed or not applicable. Falling back to standard fuzzy recall.");
         let expansions = self.query_expander.expand(query_text);
         let original_query = expansions.get(0).unwrap_or(&query_text.to_string()).clone();
         let expanded_query_str = expansions.join(" ");
 
-        // 修正：提高阈值以进行更严格的过滤。这是一个需要根据模型和数据进行调整的经验值。
         const VECTOR_SCORE_THRESHOLD: f32 = 0.5;
 
         // 步骤 2: 三路并行检索
@@ -187,26 +231,18 @@ impl MemosAgent {
             }
         )?;
 
-        // 修正：在 try_join! 之后，统一处理所有召回结果
+
         let mut all_results: Vec<Vec<ScoredPoint>> = Vec::new();
         all_results.push(vec_original_res.result);
         all_results.push(vec_expanded_res.result);
         if let Some(scroll_res) = keyword_scroll_res {
             let keyword_points = scroll_res.result.into_iter().map(|p: qdrant_client::qdrant::RetrievedPoint| {
                 ScoredPoint {
-                    id: p.id,
-                    payload: p.payload,
-                    score: 1.0, // 关键词匹配结果的 RRF 基础分设为 1.0
-                    version: 0,
-                    vectors: p.vectors,
-                    order_value: p.order_value,
-                    shard_key: p.shard_key,
+                    id: p.id, payload: p.payload, score: 1.0, version: 0, vectors: p.vectors, order_value: p.order_value, shard_key: p.shard_key,
                 }
             }).collect();
             all_results.push(keyword_points);
         }
-
-        // 步骤 3: RRF融合三路结果
         let fused_points = self.reciprocal_rank_fusion_multi(all_results, 60);
         let filtered_points = self.apply_dynamic_threshold(fused_points);
 

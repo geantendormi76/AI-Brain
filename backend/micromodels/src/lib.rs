@@ -196,6 +196,7 @@ impl Classifier {
         Ok(vector)
     }
 
+    
     fn map_str_to_intent(&self, label_str: &str) -> Intent {
         self.labels.iter().find(|&intent| {
             let intent_str = match intent {

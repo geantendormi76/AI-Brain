@@ -3,7 +3,7 @@
 use axum::{
     debug_handler,
     extract::State,
-    http::StatusCode,
+    http::{StatusCode, HeaderMap, HeaderName, HeaderValue}, // 导入HeaderMap, HeaderName
     response::{IntoResponse, Response},
     routing::post,
     Json, Router,
@@ -15,7 +15,7 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use tower_http::{cors::{Any, CorsLayer}, trace::TraceLayer};
 use std::sync::Arc;
-use tokio::task; // 导入 tokio::task
+use tokio::task;
 use common_utils::{detect_performance_mode, PerformanceMode, load_default_urls};
 use std::path::Path;
 
@@ -37,23 +37,22 @@ impl IntoResponse for ApiError {
         let error_message = self.to_string();
         eprintln!("[Server Error] {}", error_message);
         let body = Json(serde_json::json!({ "Text": "An internal server error occurred." }));
-        (StatusCode::INTERNAL_SERVER_ERROR, body).into_response()
+        
+        let mut headers = HeaderMap::new();
+        headers.insert(HeaderName::from_static("content-type"), HeaderValue::from_static("application/json; charset=utf-8"));
+
+        (StatusCode::INTERNAL_SERVER_ERROR, headers, body).into_response()
     }
 }
-
 // Axum Handler (核心修正)
 #[debug_handler]
 async fn dispatch_handler(
     State(orchestrator): State<Arc<Orchestrator>>,
     Json(payload): Json<ApiCommand>,
-) -> Result<Json<ApiResponse>, ApiError> {
+) -> Result<(StatusCode, HeaderMap, Json<ApiResponse>), ApiError> {
     let command = Command::ProcessText(payload.process_text);
 
-    // 使用 spawn_blocking 将业务逻辑移到另一个线程执行
-    // 这保证了我们的 handler 本身返回的 Future 是 Send
     let core_response = task::spawn_blocking(move || {
-        // 创建一个新的、小型的同步运行时来驱动我们的异步业务逻辑
-        // 这是在同步上下文中运行异步代码的标准模式
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
@@ -61,15 +60,18 @@ async fn dispatch_handler(
         
         rt.block_on(orchestrator.dispatch(&command))
     })
-    .await? // .await 在这里等待 spawn_blocking 的任务完成，并处理 JoinError
-    .map_err(ApiError::Dispatch)?; // 将 dispatch 内部的 anyhow::Error 转换为 ApiError
+    .await?
+    .map_err(ApiError::Dispatch)?;
 
     let api_response = match core_response {
         CoreResponse::Text(text) => ApiResponse { text },
         _ => ApiResponse { text: "[Info] Backend returned a non-text response.".to_string() },
     };
     
-    Ok(Json(api_response))
+    let mut headers = HeaderMap::new();
+    headers.insert(HeaderName::from_static("content-type"), HeaderValue::from_static("application/json; charset=utf-8"));
+    
+    Ok((StatusCode::OK, headers, Json(api_response)))
 }
 
 // 主函数 (保持不变)
