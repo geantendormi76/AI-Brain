@@ -109,10 +109,7 @@ async fn main() -> anyhow::Result<()> {
     println!("[Server] Initializing MemosAgent...");
     // 注意：这里的 MemosAgent::new 调用可能需要根据WSL版的定义来调整
     // 我们先假设WSL版的 new 函数需要 qdrant_url 和 embedding_url
-    let memos_agent = MemosAgent::new(
-        &service_urls.qdrant_url, 
-        &service_urls.embedding_url
-    ).await?;
+    let memos_agent = MemosAgent::new(qdrant_url, embedding_url, &models_path).await?;
     let agents: Vec<Box<dyn memos_core::Agent>> = vec![Box::new(memos_agent)];
     
     println!("[Server] Initializing Orchestrator...");

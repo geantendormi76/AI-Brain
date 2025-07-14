@@ -1,18 +1,23 @@
-// backend/micromodels/src/proto/preprocessor.proto
+// micromodels/src/proto/preprocessor.proto (V2 - 支持NER)
 syntax = "proto3";
 
 package micromodels;
 
-// 定义单个TF-IDF特征集的数据结构
+// --- V1: 用于TF-IDF分类器的预处理器数据 ---
 message TfidfFeatureData {
-  // 有序的词汇表，其顺序与idf_weights严格对应
   repeated string vocabulary = 1;
-  // 有序的IDF权重
   repeated float idf_weights = 2;
 }
 
-// 定义完整的预处理器数据，包含词和字符两个特征集
+// 这是旧的顶层消息，为了向后兼容，我们保留它
 message PreprocessorData {
   TfidfFeatureData word_features = 1;
   TfidfFeatureData char_features = 2;
+}
+
+// --- V2: 用于NER序列标注模型的预处理器数据 ---
+message NerPreprocessorData {
+  // 使用 map 类型，key是词，value是索引。
+  map<string, int32> word_to_ix = 1;
+  map<string, int32> tag_to_ix = 2;
 }

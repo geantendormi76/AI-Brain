@@ -56,7 +56,7 @@ async fn main() -> Result<(), anyhow::Error> {
     let qdrant_url = "http://localhost:6334";
     let llm_url = "http://localhost:8282";
     let embedding_url = "http://localhost:8181";
-    let memos_agent = MemosAgent::new(qdrant_url, embedding_url).await?; 
+    let memos_agent = MemosAgent::new(qdrant_url, embedding_url, &models_path).await?;
     let agents: Vec<Box<dyn Agent>> = vec![Box::new(memos_agent)];
     println!("Agents loaded: {} agent(s)", agents.len());
 
